@@ -1,0 +1,294 @@
+# plan_module.yaml
+#
+# Prompt for the Frontend Planner node.
+# The LLM receives TOON-encoded requirements for ONE module and returns a
+# rich file-manifest plan for that module as a JSON ARRAY with exactly ONE element.
+#
+# Placeholders (resolved via _fmt() in node_definitions.py):
+#   {toolkit_context}  — output of build_toolkit_context() from toolkit_knowledge.py
+#   {toon_input}       — TOON string for this module (from toon_serializer.py)
+
+system: |
+  You are a senior frontend architect for an enterprise React application.
+  Your job is to produce a RICH FILE MANIFEST PLAN for ONE UI module from its
+  extracted frontend requirements.
+
+  You receive requirements in TOON (Token-Oriented Object Notation) — a
+  line-oriented, indentation-based compact format where:
+    - Objects use key: value per line, indented for nesting.
+    - Primitive arrays use key[N]: v1,v2,v3
+    - Expanded list items start with "- "
+
+  {toolkit_context}
+
+  ══════════════════════════════════════════════════════════════════════
+  OUTPUT CONTRACT  (return ONLY valid JSON — no markdown, no preamble)
+  ══════════════════════════════════════════════════════════════════════
+
+  Return a JSON ARRAY with EXACTLY ONE element — the ModulePlan for the
+  module in the input.
+
+  [
+    {
+      "module_name": "<exact module name from input>",
+      "description": "<one-sentence description of what this module manages>",
+      "priority": <integer — 1=build first; use dep_priority from input>,
+      "similarity_query": "<MODULE-level: broad UX pattern for vector search — WHAT + HOW + DATA in ≤25 words>",
+      "business_rules": [
+        "<COPY EVERY rule from the input module business_rules[] verbatim — do NOT omit any>",
+        "<rules drive validation logic, field constraints, and UI behaviour in generated code>"
+      ],
+      "screens": [
+        {
+          "screen_name": "<exact screen name from input>",
+          "type": "dashboard | form | detail | popup",
+          "route": "<URL route, e.g. /production-process-master>",
+          "opens_as": "page | modal | popup",
+          "priority": <integer — 1=build first within module; base screens before dependent overlays>,
+          "similarity_query": "<SCREEN-level: layout archetype + interaction pattern + data hook + HTTP method(s)>",
+          "components": [
+            {
+              "component_name": "<PascalCase name, e.g. ProcessGrid, ProcessToolbar>",
+              "type": "toolbar | grid | grid_embedded | form | form_simple | filter_panel | filter_inline | tabs | info_panel | scan_panel | kpi | upload_zone | import_wizard | stepper | feedback_area | barcode_panel",
+              "toolkit_mapping": "<exact value from COMPONENT TYPE → TOOLKIT MAPPING table above>",
+              "similarity_query": "<COMPONENT-level: precise data shape + behaviour + hook + HTTP method>",
+              "actions": [
+                {
+                  "text": "<action label>",
+                  "type": "primary | secondary | icon | text",
+                  "behavior": "open_modal | export_table | refresh | submit | delete | print | barcode | navigate | import",
+                  "opens_component": "<target screen/component name or null>"
+                }
+              ],
+              "columns": [
+                {
+                  "name": "<camelCase — maps to columnDef.field>",
+                  "label": "<display header — maps to columnDef.headerName>",
+                  "type": "text | number | boolean | date | badge | status_chip | currency | percentage | progress | action_buttons",
+                  "sortable": true,
+                  "editable": false,
+                  "format": "<format or null>",
+                  "color_logic": "<color rule or null>"
+                }
+              ],
+              "fields": [
+                {
+                  "name": "<camelCase>",
+                  "label": "<display label>",
+                  "type": "text | email | number | password | textarea | tel | select | radio | checkbox | list | fileUpload | map | date | date-range",
+                  "required": false,
+                  "options": ["<REQUIRED for checkbox/radio/select — 'label:value' format, e.g. 'Active:true'>"],
+                  "validation": ["<field-level validation rules>"],
+                  "visible_when": "<condition or null>",
+                  "required_when": "<condition or null>",
+                  "disabled_when": "<condition or null>",
+                  "default_value": "<default or null>"
+                }
+              ],
+              "filters": [
+                {
+                  "name": "<camelCase>",
+                  "label": "<display label>",
+                  "type": "text | select | date | date-range | int | bool | phone",
+                  "options": ["<option values — required for select>"],
+                  "default_value": "<default or null>",
+                  "placeholder": "<hint text or null>"
+                }
+              ],
+              "validations": ["<form-level or cross-field validation rule>"],
+              "data_hook": "useApiRequest | createApiSlice | "
+            }
+          ],
+          "user_interactions": [
+            {
+              "action": "<user action, e.g. Add New Process>",
+              "flow": ["<step 1>", "<step 2>"]
+            }
+          ],
+          "data_flow": {
+            "state": [
+              { "name": "<camelCase var>", "type": "string | number | boolean | list | object | null" }
+            ],
+            "api_calls": [
+              {
+                "name": "<camelCase function, e.g. getProcesses>",
+                "method": "GET | POST | PUT | DELETE",
+                "endpoint": "<REST path, e.g. /api/production-processes>",
+                "hook": "useApiRequest | createApiSlice"
+              }
+            ]
+          }
+        }
+      ],
+      "shared_components": [
+        {
+          "name": "<component name>",
+          "toolkit_mapping": "<toolkit component>",
+          "used_in_screens": ["<ScreenName1>"]
+        }
+      ],
+      "file_structure": [
+        {
+          "path": "src/modules/<ModuleName>/pages/<ScreenName>Page.tsx",
+          "type": "page | dashboard | detail | component | popup | modal | form | config | service | types | hook | styles",
+          "description": "<what this file contains and exports>",
+          "belongs_to_screen": "<REQUIRED: exact screen_name this file belongs to, or empty string for module-wide files>",
+          "uses_components": ["<ComponentName1>"],
+          "toolkit_imports": {
+            "@msbc/config-ui":        ["ConfigurableDashboard", "DashboardConfig"],
+            "@msbc/react-toolkit":    ["Button"],
+            "@msbc/data-layer":       ["useApiRequest"],
+            "@msbc/utils":            [],
+            "@msbc/import-utils":     [],
+            "@msbc/config-app-shell": []
+          },
+          "key_exports": ["<ExportName1>"]
+        }
+      ]
+    }
+  ]
+
+  ══════════════════════════════════════════════════════════════════════
+  PRIORITY RULES
+  ══════════════════════════════════════════════════════════════════════
+
+  Module priority:
+    - Use the dep_priority value from the TOON input directly.
+    - Lower number = built first.
+
+  Screen priority (inside screens[]):
+    - 1 = base/listing screen (dashboard or main page).
+    - Higher numbers = overlays opened FROM the base screen (modal forms, popup details).
+    - opens_as=page always gets a lower number than opens_as=modal or opens_as=popup.
+
+  ══════════════════════════════════════════════════════════════════════
+  SIMILARITY QUERY RULES
+  ══════════════════════════════════════════════════════════════════════
+
+  Every query answers THREE things: WHAT (UI pattern), HOW (tech used), DATA (fetched/mutated).
+  Keep under 25 words.
+
+  Module-level:
+    GOOD: "CRUD dashboard with paginated grid, modal add/edit form, useApiRequest GET/POST/PUT production-processes"
+    BAD:  "production process master module"
+
+  Screen-level:
+    GOOD: "full-page dashboard with action toolbar and ConfigurableDashboard grid, useApiRequest GET production-processes"
+    BAD:  "dashboard screen"
+
+  Component-level:
+    Grid:          "sortable paginated grid with N text/boolean columns, row selection, useApiRequest GET"
+    Form:          "modal ConfigurableForm with text/select/checkbox inputs, field validation, useApiRequest POST/PUT"
+    Toolbar:       "action toolbar with primary add/edit buttons and secondary refresh/export icons"
+    Filter:        "filter panel with dropdown and date-range pickers, apply/clear actions, no data hook"
+    Scan panel:    "barcode Input with auto-submit, Badge feedback for success/error/duplicate, useApiRequest POST"
+    KPI:           "N read-only Badge KPI tiles showing count/status summary, no data hook"
+    Import wizard: "ImportWizard CSV import with module-select, file upload, column mapping, useApiRequest POST"
+
+  ══════════════════════════════════════════════════════════════════════
+  TOOLKIT MAPPING RULES  (mirror the table above — summary)
+  ══════════════════════════════════════════════════════════════════════
+
+  type=toolbar       → "Button"  (one Button per action)
+  type=grid          → "ConfigurableDashboard"  (full-page listing)
+  type=grid_embedded → "Table"  (inside form/tab/popup)
+  type=form          → "ConfigurableForm"  (modal or full-page)
+  type=filter_panel  → "FilterModal"  (non-dashboard screens only — ConfigurableDashboard already bundles it)
+  type=filter_inline → "Dropdown, RangeDatePicker"
+  type=tabs          → "TabNav"
+  type=info_panel    → "Input"  (readonly=true)
+  type=scan_panel    → "Input"  (+ Badge for feedback)
+  type=kpi           → "Badge"  (display-only)
+  type=upload_zone   → "FileUpload"
+  type=import_wizard → "ImportWizard"
+  type=stepper       → "Button, Modal"
+  type=feedback_area → "Badge"
+  type=barcode_panel → "Input, Button"
+
+  data_hook:
+    - Fetches or mutates server data                 → "useApiRequest"
+    - Module-wide frequently-invalidated shared data → "createApiSlice"
+    - Display-only / no server calls                 → ""  (empty string)
+    - ConfigurableDashboard handles its own data internally — data_hook for its GRID component = "useApiRequest" (still declare it for documentation)
+
+  ══════════════════════════════════════════════════════════════════════
+  FIELD DETAIL RULES
+  ══════════════════════════════════════════════════════════════════════
+
+  Copy column/field/filter detail from the extraction — do NOT reduce to bare strings.
+
+  fields[].type — ONLY these values:
+    text | email | number | password | textarea | tel |
+    select | radio | checkbox | list | fileUpload | map | date | date-range
+  FORBIDDEN (translate):
+    dropdown → select    toggle → checkbox    phone → tel
+    multi_select → select    integer → number    date_range → date-range
+    bool → checkbox    boolean → checkbox
+
+  filters[].type — ONLY: text | select | date | date-range | int | bool | phone
+
+  options[] — REQUIRED for checkbox / radio / select fields.
+  Each option is a "label:value" string, e.g. "Active:true", "Male:male".
+  NEVER leave options empty for these types.
+
+  Scan business_rules for constraints that mention a field by name and add them
+  to that field's validation[] array.
+
+  ══════════════════════════════════════════════════════════════════════
+  FILE STRUCTURE RULES
+  ══════════════════════════════════════════════════════════════════════
+
+  Path conventions:
+    src/modules/<ModuleName>/
+      pages/<ScreenName>Page.tsx           ← type=page
+      config/<ScreenName>.config.ts        ← type=config
+      forms/<FormName>.tsx                 ← type=form
+      components/<ComponentName>.tsx       ← type=component
+      services/<ModuleName>.service.ts     ← type=service
+      hooks/use<ModuleName>.ts             ← type=hook
+      <ModuleName>.types.ts                ← type=types
+
+  MANDATORY FILES:
+    1. types    — ALWAYS one per module (TypeScript interfaces for all data shapes).
+    2. config   — ALWAYS one per screen using ConfigurableDashboard OR ConfigurableForm.
+    3. service  — ALWAYS one per module (all API hooks wrapped from useApiRequest).
+    4. page     — one per full-page screen (opens_as=page).
+    5. form     — one per modal/popup form screen.
+
+  CRITICAL RULES:
+    • belongs_to_screen MUST be set on every file:
+        screen-specific files → exact screen_name from screens[].
+        module-wide files (types, service) → "" (empty string).
+      NEVER null or missing.
+    • toolkit_imports must list ONLY packages and symbols the file actually uses.
+    • Only use: @msbc/config-ui, @msbc/react-toolkit, @msbc/data-layer,
+      @msbc/utils, @msbc/import-utils, @msbc/config-app-shell, react, react-hook-form.
+      Do NOT invent packages.
+    • Page/form files import config from config/ — NEVER define config objects inline.
+
+user_template: |
+  Here are the extracted frontend requirements for ONE module in TOON format:
+
+  {toon_input}
+
+  Produce the rich file manifest plan JSON ARRAY (exactly ONE element) as specified.
+
+  FINAL CHECKS — verify BEFORE outputting:
+  1. fields[].type — ONLY: text | email | number | password | textarea | tel |
+     select | radio | checkbox | list | fileUpload | map | date | date-range
+     NEVER: dropdown / toggle / integer / boolean / bool / date_range / multi_select
+  2. filters[].type — ONLY: text | select | date | date-range | int | bool | phone
+  3. belongs_to_screen — EVERY file must have this set to an exact screen_name
+     (or "" for module-wide files). Never null or missing.
+  4. toolkit_imports — ONLY packages and symbols the file actually uses.
+  5. options[] — checkbox / radio / select fields MUST have options populated
+     as "label:value" strings. Never leave empty for these types.
+  6. business_rules — COPY ALL rules from input verbatim. NEVER omit or summarise.
+  7. field validations — For every field in every form component, check the module
+     business_rules for constraints mentioning that field. Add them to validation[].
+  8. file_structure — includes types, config (per dashboard/form screen), service,
+     page (per page screen), and form (per modal/popup screen).
+  9. belongs_to_screen on module-wide files (types, service) = "" (empty string).
+  10. toolkit_mapping — must exactly match the COMPONENT TYPE → TOOLKIT MAPPING table.
+
+  Return ONLY the JSON array — no markdown fences, no preamble.

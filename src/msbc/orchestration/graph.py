@@ -1,0 +1,130 @@
+"""
+LangGraph workflow for the requirement extractor.
+
+Graph topology (flat — no nested subgraphs):
+
+  START
+    │
+    ▼
+  segmentation_node
+    │  (conditional edge — fan_out_to_modules returns N Send objects)
+    ├──► extract_module_node (module 0)  ─┐
+    ├──► extract_module_node (module 1)  ─┤  (all run in parallel)
+    └──► extract_module_node (module N)  ─┘
+                                          │
+                                          ▼
+                                     finalize_node
+                                     (pure-Python collect + graph-builder LLM)
+                                          │
+                                          ▼
+                                         END
+
+Entry point: run_extraction(document_text, heading_hierarchy, mode)
+"""
+
+import logging
+from typing import Any
+
+from langgraph.graph import END, START, StateGraph
+
+from src.msbc.llm.clients.openai_client import merge_usage
+from src.msbc.orchestration.nodes.edge_logic import fan_out_to_modules
+from src.msbc.orchestration.nodes.node_definitions import (
+    extract_module_node,
+    finalize_node,
+    segmentation_node,
+)
+from src.msbc.orchestration.state import ExtractionState
+
+logger = logging.getLogger(__name__)
+
+# ── Build and compile the graph once at import time ───────────────────────────
+
+def _build_graph():
+    builder = StateGraph(ExtractionState)
+
+    # Nodes
+    builder.add_node("segmentation_node",   segmentation_node)
+    builder.add_node("extract_module_node", extract_module_node)
+    builder.add_node("finalize_node",       finalize_node)
+
+    # Edges
+    builder.add_edge(START, "segmentation_node")
+
+    # Fan-out: segmentation → N × extract_module_node (via Send)
+    builder.add_conditional_edges(
+        "segmentation_node",
+        fan_out_to_modules,
+        ["extract_module_node"],
+    )
+
+    # Fan-in: all extract_module_node results collected before finalize
+    builder.add_edge("extract_module_node", "finalize_node")
+    builder.add_edge("finalize_node",       END)
+
+    return builder.compile()
+
+
+_workflow = _build_graph()
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+async def run_extraction(
+    document_text: str,
+    heading_hierarchy: list[dict],
+    mode: str,
+) -> dict[str, Any]:
+    """
+    Run the full requirement extraction workflow.
+
+    Args:
+        document_text:     Full plain-text content of the uploaded document.
+        heading_hierarchy: List of {level: int, text: str} dicts from the extractor.
+        mode:              "frontend" | "backend" | "both"
+
+    Returns:
+        {
+            "extraction": <per-module requirements (pure-Python assembled)>,
+            "graph":      <dependency graph JSON>,
+            "usage":      <aggregated LLM usage/cost dict>,
+        }
+    """
+    logger.info(
+        "run_extraction: starting — mode=%s, doc_length=%d chars, headings=%d.",
+        mode, len(document_text), len(heading_hierarchy),
+    )
+
+    initial_state: ExtractionState = {
+        "document_text":     document_text,
+        "heading_hierarchy": heading_hierarchy,
+        "mode":              mode,
+        "modules":           [],
+        "results":           [],
+        "extraction":        {},
+        "graph":             {},
+        "all_usage":         [],
+    }
+
+    final_state: ExtractionState = await _workflow.ainvoke(initial_state)
+
+    # Aggregate all usage dicts collected across every node
+    all_usage: list[dict[str, Any]] = final_state.get("all_usage", [])
+    for result in final_state.get("results", []):
+        all_usage.extend(result.get("usage", []))
+
+    usage_summary = merge_usage(all_usage) if all_usage else {}
+
+    total_modules = final_state.get("extraction", {}).get("total_modules", 0)
+    logger.info(
+        "run_extraction: complete — %d module(s), total tokens=%d, cost=$%.4f.",
+        total_modules,
+        usage_summary.get("total_tokens", 0),
+        usage_summary.get("total_cost_usd", 0.0),
+    )
+
+    return {
+        "extraction": final_state.get("extraction", {}),
+        "graph":      final_state.get("graph",      {}),
+        "usage":      usage_summary,
+    }

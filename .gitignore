@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.env
+*.db
+
+# Database folder (local SQLite storage, not for version control)
+generated_codes/
+
+*.pem
+
+# Logs and temporary files
+logs/
+
+# IDE and editor files
+.vscode/
+.claude/
+.idea/
+SKELETON/
+
+# Unwanted README files
+CODEBASE_OVERVIEW.md
+CODEBASE_INDEX.json
+scratch_files.txt

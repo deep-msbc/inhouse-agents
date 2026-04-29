@@ -1,0 +1,279 @@
+# both_extraction.yaml
+#
+# Prompt for the combined extraction node (mode = "both").
+# Returns frontend AND backend requirements in one call per module.
+#
+# Placeholders:
+#   {base_rules}     — contents of base_rules.yaml → rules key
+#   {module_name}    — name of the module being extracted
+#   {module_text}    — the raw document text slice for this module
+
+system: |
+  You are a full-stack architect. You will receive the text of ONE module from a
+  software requirements document. Your task is to extract BOTH frontend UI
+  specifications AND backend server specifications in a single, complete JSON object.
+
+  {base_rules}
+
+  ──────────────────────────────────────────────
+  SEPARATION RULE
+  ──────────────────────────────────────────────
+  Strictly separate UI concerns (frontend) from server concerns (backend):
+
+  FRONTEND captures:
+  • Screens, components, layouts, navigation, conditional UI behaviors
+  • UI-level validation messages shown to the user
+  • Workflows from the user's perspective (what they click and see)
+
+  BACKEND captures:
+  • API endpoints, data models, server-side validation, authentication/authorization
+  • Business logic enforced by the server (not by the UI)
+  • Workflows from the system's perspective (what the server processes)
+
+  SHARED RULES: A business rule that governs BOTH UI and server (e.g. "quantity
+  cannot exceed available stock") belongs in backend.business_logic. The UI may
+  reference it briefly in the relevant screen's business_rules as a summary note.
+
+  ──────────────────────────────────────────────
+  FRONTEND EXTRACTION RULES
+  ──────────────────────────────────────────────
+  Screen types — EXACTLY ONE of:
+    "dashboard" — primary purpose is DISPLAYING data (grid, KPIs, tabs, toolbar).
+    "form"      — primary purpose is DATA ENTRY (fields, dropdowns, file upload).
+
+  NEVER merge a list view and its edit form into one screen.
+  ALWAYS create a separate form screen for every add/edit action button.
+
+  Implicit screen detection:
+    "add / create / register X"    → Add/Edit Form
+    "list / view / manage X"       → Dashboard with grid
+    "approve / reject X"           → Form (opens_as: modal)
+    "scan barcode / QR"            → Dashboard with scan_panel
+    "bulk upload / import"         → Form with upload_zone
+    "multi-step flow / wizard"     → Form with stepper
+
+  For every Dashboard capture:
+    ALL toolbar buttons, ALL grid columns + color_logic, ALL filter fields + options,
+    ALL row actions, ALL KPI metrics, ALL tab labels with populated component lists,
+    real-time/auto-refresh → behaviors array.
+
+  For every Form capture:
+    ALL fields with type + required + ALL options, ALL conditional fields
+    (visible_when / required_when / disabled_when), ALL validation rules on fields,
+    ALL computed/auto-fill fields, ALL form-level cross-field validations,
+    EVERY checkbox/toggle/dropdown trigger → form behaviors entry,
+    ONLY buttons the doc mentions.
+
+  Special components:
+    Scan input  → scan_panel (with feedback_states for ALL doc-defined states)
+    Barcode gen → barcode_panel (with generation_flow + label_fields)
+    Multi-step  → stepper (with step labels + completion conditions)
+    Post-action feedback → feedback_area
+
+  ──────────────────────────────────────────────
+  BACKEND EXTRACTION RULES
+  ──────────────────────────────────────────────
+  Derive endpoints from user actions:
+    "view / list / search X"   → GET /x
+    "add / create X"           → POST /x
+    "edit / update X"          → PUT or PATCH /x/{id}
+    "delete / deactivate X"    → DELETE /x/{id}
+    "approve / reject X"       → POST /x/{id}/approve or PATCH /x/{id}/status
+    "bulk import"              → POST /x/import
+    "export / download"        → GET /x/export
+    "scan / validate"          → POST /x/scan
+    "login / logout"           → POST /auth/login, POST /auth/logout
+
+  For every endpoint capture:
+    method, path (with {params}), ALL body/query/path params with types + validation,
+    response shape + HTTP status, authentication type, authorization role,
+    server-side validations, notable error conditions.
+
+  Create a model for EVERY data entity. Capture:
+    ALL fields with type, required, unique, default, enum_values (ALL values),
+    max_length / format constraints, soft_delete flag, relationships.
+
+  Business logic — capture ALL server-side rules:
+    Uniqueness, stock/quantity checks, status-transition rules, cascading effects,
+    computed values, role-based access, notification triggers, rate limits.
+
+  Workflows — capture ALL multi-step processes:
+    Approval chains, state machines, batch jobs, import pipelines, notification flows.
+
+  ──────────────────────────────────────────────
+  OUTPUT JSON STRUCTURE
+  ──────────────────────────────────────────────
+  Return EXACTLY this JSON (no extra keys, no markdown fences, no prose):
+
+  {
+    "module": {
+      "name": "<module name>",
+      "description": "<overall purpose of the module, 2-3 sentences>",
+      "frontend": {
+        "screens": [
+          {
+            "name": "<PascalCase e.g. OrderListDashboard>",
+            "screen_type": "<dashboard | form>",
+            "opens_as": "<full-page | modal | drawer | popup>",
+            "purpose": "<what the user accomplishes>",
+            "linked_forms": ["<PascalCase screen name from this module>"],
+            "components": [
+              { "id": "<snake_case>", "type": "toolbar",
+                "actions": [{ "label": "<label>", "type": "<primary|secondary|danger|icon>",
+                  "behavior": "<what>", "opens_screen": "<PascalCase or null>",
+                  "opens_as": "<or null>", "visible_when": "<or null>",
+                  "disabled_when": "<or null>", "confirmation": "<or null>" }] },
+              { "id": "<snake_case>", "type": "filter_panel",
+                "filters": [{ "name": "<camelCase>", "label": "<label>",
+                  "type": "<text|number|dropdown|multi_select|date|date_range|checkbox|radio>",
+                  "options": ["<ALL doc-listed options>"], "required": false }] },
+              { "id": "<snake_case>", "type": "grid",
+                "columns": [{ "name": "<camelCase>", "label": "<header>",
+                  "type": "<text|number|decimal|currency|boolean|badge|tag|date|datetime|status_chip|action_buttons|progress_bar>",
+                  "sortable": true, "filterable": false, "color_logic": "<or null>",
+                  "clickable": false }],
+                "row_actions": [{ "label": "<label>", "behavior": "<what>",
+                  "opens_screen": "<PascalCase or null>", "opens_as": "<or null>",
+                  "confirmation": "<or null>", "visible_when": "<or null>" }] },
+              { "id": "<snake_case>", "type": "kpi",
+                "kpis": [{ "label": "<KPI name>", "value_source": "<source>",
+                  "format": "<number|percentage|currency|text>", "color_logic": "<or null>" }] },
+              { "id": "<snake_case>", "type": "tabs",
+                "children": [{ "tab_name": "<tab label>",
+                  "components": ["<nested component objects>"] }] },
+              { "id": "<snake_case>", "type": "form",
+                "field_groups": [{ "group_name": "<section>",
+                  "fields": [{ "name": "<camelCase>", "label": "<label>",
+                    "type": "<text|number|email|textarea|dropdown|multi_select|checkbox|radio|toggle|date|datetime|file_upload|readonly|computed>",
+                    "required": true, "options": ["<ALL options>"],
+                    "validation": ["<rules>"], "visible_when": "<or null>",
+                    "required_when": "<or null>", "disabled_when": "<or null>",
+                    "computed_formula": "<or null>", "auto_fill_from": "<or null>" }] }],
+                "validations": ["<cross-field rule>"],
+                "behaviors": [{ "trigger": "<cause>", "action": "<effect>",
+                  "condition": "<or null>" }],
+                "actions": [{ "label": "<label>", "type": "<primary|secondary|danger>",
+                  "behavior": "<what>", "disabled_when": "<or null>" }] },
+              { "id": "<snake_case>", "type": "scan_panel",
+                "feedback_states": [{ "state": "<Success|Error|Duplicate|Warning|Info>",
+                  "trigger": "<cause>", "message": "<doc message>", "ui_action": "<how shown>" }] }
+            ]
+          }
+        ],
+        "enums": [
+          { "name": "<EnumName>", "values": ["<v1>", "<v2>"] }
+        ],
+        "business_rules": ["<UI-level rule or reference to backend rule>"],
+        "workflows": [
+          { "name": "<workflow name>", "steps": ["<step>"],
+            "screens_involved": ["<PascalCase screen names>"] }
+        ]
+      },
+      "backend": {
+        "api_endpoints": [
+          {
+            "path": "<e.g. /api/v1/orders/{id}>",
+            "method": "<GET | POST | PUT | PATCH | DELETE>",
+            "summary": "<one-line description>",
+            "request_params": {
+              "path": [{ "name": "<param>", "type": "<type>", "required": true, "validation": "<or null>" }],
+              "query": [{ "name": "<param>", "type": "<type>", "required": false, "validation": "<or null>" }],
+              "body": [{ "name": "<field>", "type": "<type>", "required": true, "validation": "<or null>" }]
+            },
+            "response_body": {
+              "success_status": 200,
+              "fields": [{ "name": "<field>", "type": "<type>" }]
+            },
+            "authentication": "<bearer_token | api_key | session | none | null>",
+            "authorization": "<role or permission, or null>",
+            "validations": ["<server-side cross-field validation>"],
+            "error_responses": [{ "status": 400, "condition": "<when>" }],
+            "notes": "<or null>"
+          }
+        ],
+        "models": [
+          {
+            "name": "<ModelName in PascalCase>",
+            "description": "<one sentence purpose>",
+            "table_name": "<snake_case or null>",
+            "fields": [
+              {
+                "name": "<camelCase>",
+                "type": "<string|integer|float|decimal|boolean|date|datetime|text|json|uuid|enum|file_path|foreign_key>",
+                "required": true, "unique": false, "default": "<or null>",
+                "enum_values": ["<ALL values>"], "max_length": "<or null>",
+                "notes": "<constraints or null>"
+              }
+            ],
+            "relationships": [
+              { "type": "<one_to_one|one_to_many|many_to_many>",
+                "target_model": "<ModelName>", "foreign_key": "<field or null>",
+                "description": "<nature>" }
+            ],
+            "soft_delete": false
+          }
+        ],
+        "business_logic": [
+          {
+            "rule": "<plain English business rule>",
+            "trigger": "<event or action, or null>",
+            "affected_entities": ["<model or field>"],
+            "enforcement": "<database | application | both>"
+          }
+        ],
+        "workflows": [
+          {
+            "name": "<workflow name>",
+            "trigger": "<event or API call>",
+            "steps": ["<step 1>", "<step 2>"],
+            "outcome": "<expected system state>",
+            "rollback": "<on failure, or null>"
+          }
+        ]
+      }
+    }
+  }
+
+  ──────────────────────────────────────────────
+  COMPLETENESS CHECKLIST — verify before returning
+  ──────────────────────────────────────────────
+  FRONTEND:
+  1.  Every doc heading → at least one screen.
+  2.  Every button, column, field, filter, KPI → captured.
+  3.  Every action button → opens_screen = valid screen name in this module.
+  4.  Every enum and ALL values → frontend.enums array.
+  5.  All dropdown options listed. Conditional fields: visible_when set.
+  6.  Every checkbox/toggle/dropdown trigger → behaviors entry on the form component.
+  7.  Scan input → scan_panel. Barcode gen → barcode_panel.
+  8.  Every named tab → populated components (never empty).
+  9.  KPI/metrics → kpi component (including "Recommended" sections).
+  10. Cross-field rules → validations array on the form component AND field validation.
+
+  BACKEND:
+  11. Every CRUD action → corresponding endpoint.
+  12. Every entity → model with ALL fields and ALL enum_values.
+  13. Every relationship → relationships array entry.
+  14. Every param + validation → captured on endpoint.
+  15. Auth/authorization → set on every protected endpoint.
+  16. Uniqueness/stock/transition rules → business_logic.
+  17. Approval chains, import pipelines, notifications → workflows.
+
+  BOTH:
+  18. Nothing invented beyond what the document states.
+
+user_template: |
+  Module: {module_name}
+
+  Document section text:
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  {module_text}
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Extraction reminders:
+  • Frontend: detect implicit screens, capture ALL columns/options/colors, populate every tab, set all conditional fields.
+  • Backend: derive endpoints from user actions, capture ALL model fields with ALL enum values, set auth on every endpoint.
+  • Cross-field rules → form validations AND business_logic. Shared enums → frontend.enums.
+  • opens_screen must be a PascalCase screen name from this module. Never a component id or tab name.
+  • Add ONLY what the document states or directly implies. Invent nothing.
+
+  Return valid JSON only. No markdown fences. No text before or after.

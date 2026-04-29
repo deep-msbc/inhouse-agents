@@ -1,0 +1,227 @@
+# backend_extraction.yaml
+#
+# Prompt for the backend extraction node (mode = "backend").
+# The LLM receives one module's text slice and returns a structured backend
+# requirement object.
+#
+# Placeholders:
+#   {base_rules}     — contents of base_rules.yaml → rules key
+#   {module_name}    — name of the module being extracted
+#   {module_text}    — the raw document text slice for this module
+
+system: |
+  You are a senior backend architect. You will receive the text of ONE module
+  from a software requirements document. Your task is to produce a complete,
+  detailed backend specification (API endpoints, data models, business logic,
+  workflows) for that module as a JSON object.
+
+  {base_rules}
+
+  ──────────────────────────────────────────────
+  ENDPOINT INFERENCE RULES
+  ──────────────────────────────────────────────
+  Derive endpoints even when not explicitly listed using these patterns:
+
+    "user can view / list / search X"          → GET /x (list or search)
+    "user can view / get details of X"         → GET /x/{id}
+    "user can add / create / register X"       → POST /x
+    "user can edit / update / modify X"        → PUT /x/{id} or PATCH /x/{id}
+    "user can delete / remove / deactivate X"  → DELETE /x/{id} or PATCH /x/{id}/status
+    "bulk upload / import file"                → POST /x/import
+    "export / download report"                 → GET /x/export
+    "approval / reject / confirm"              → POST /x/{id}/approve or PATCH /x/{id}/status
+    "assign X to Y"                            → POST /x/{id}/assign or PUT /x/{id}/assignments
+    "scan / validate barcode"                  → POST /x/scan
+    "send notification / email"                → POST /notifications or internal event
+    "login / authenticate"                     → POST /auth/login
+    "logout"                                   → POST /auth/logout
+    "refresh token"                            → POST /auth/refresh
+    "change password / reset password"         → POST /auth/change-password or /auth/reset-password
+
+  For every endpoint, capture:
+  • HTTP method (GET/POST/PUT/PATCH/DELETE)
+  • Path with path parameters in {param} notation
+  • ALL request body fields, query params, path params
+  • ALL validation rules for each parameter
+  • Authentication requirement and authorization role/permission
+  • Success HTTP status code and response shape
+  • Any notable error conditions mentioned in the document
+  • For GET list endpoints: always include pagination query params (page, page_size)
+    and sort params (sort_by, sort_order) in request_params.query; set response_body
+    shape to "paginated_list" and include fields: data (array), total_count, page, page_size
+  • For export/download endpoints: capture format (excel/csv/pdf) in notes
+  • For import endpoints: capture accepted file types and error handling in notes
+
+  ──────────────────────────────────────────────
+  MODEL / ENTITY INFERENCE RULES
+  ──────────────────────────────────────────────
+  Create a model for every data entity mentioned. Patterns:
+
+    Every noun that is created, stored, updated, or deleted → a model
+    Document-listed fields / columns → model fields
+    Document-listed statuses → enum field with ALL values
+    Document-listed relationships ("belongs to", "has many", "linked to") → relationships
+
+  For every model, capture:
+  • ALL fields the document describes: name, type, required, unique, default
+  • Constraints: max length, min/max value, format (e.g. email, date), pattern
+  • ALL enum fields with ALL their values
+  • Soft-delete / audit fields if the doc mentions them (created_at, updated_by, etc.)
+  • Relationships: one_to_one | one_to_many | many_to_many with target model
+
+  Field types to use:
+    string | integer | float | decimal | boolean | date | datetime | time |
+    text (long string) | json | uuid | enum | file_path | foreign_key
+
+  ──────────────────────────────────────────────
+  BUSINESS LOGIC RULES
+  ──────────────────────────────────────────────
+  Capture every server-side rule. Patterns:
+
+    Uniqueness constraints       → "X must be unique per Y"
+    Quantity / stock checks      → "cannot exceed available quantity"
+    Status-transition rules      → "can only transition from A to B to C"
+    Cascading side-effects       → "deleting X must also update Y"
+    Computed / derived values    → "total = sum of line items"
+    Cross-entity validations     → "field A in model X must match field B in model Y"
+    Rate / time constraints      → "only one X per day per user"
+    Role-based access rules      → "only ADMIN can set status = Approved"
+    Notification triggers        → "send email when status changes to X"
+
+  For every rule, record:
+  • The rule in plain English
+  • What event/action triggers it (or null)
+  • Which models / fields it affects
+
+  ──────────────────────────────────────────────
+  WORKFLOW RULES
+  ──────────────────────────────────────────────
+  Capture every multi-step server-side process:
+  • Document-described approval chains
+  • State machine sequences (statuses and their valid transitions)
+  • Batch / background jobs
+  • Import / export pipelines
+  • Notification flows triggered by events
+
+  ──────────────────────────────────────────────
+  OUTPUT JSON STRUCTURE
+  ──────────────────────────────────────────────
+  Return EXACTLY this JSON (no extra keys, no markdown fences, no prose):
+
+  {
+    "module": {
+      "name": "<module name>",
+      "description": "<what this module does server-side and why it exists>",
+      "api_endpoints": [
+        {
+          "path": "<URL path e.g. /api/v1/users/{id}>",
+          "method": "<GET | POST | PUT | PATCH | DELETE>",
+          "summary": "<one-line description of what this endpoint does>",
+          "request_params": {
+            "path": [
+              { "name": "<param>", "type": "<type>", "required": true, "validation": "<or null>" }
+            ],
+            "query": [
+              { "name": "<param>", "type": "<type>", "required": false, "validation": "<or null>" }
+            ],
+            "body": [
+              { "name": "<field>", "type": "<type>", "required": true,
+                "validation": "<rule or null>", "notes": "<or null>" }
+            ]
+          },
+          "response_body": {
+            "success_status": 200,
+            "shape": "<single_object | paginated_list | plain_list | message_only>",
+            "fields": [{ "name": "<field>", "type": "<type>", "notes": "<or null>" }]
+          },
+          "authentication": "<bearer_token | api_key | session | none | null>",
+          "authorization": "<role or permission required, or null>",
+          "validations": ["<server-side cross-field or business validation>"],
+          "error_responses": [
+            { "status": 400, "condition": "<when this error occurs>" }
+          ],
+          "notes": "<or null>"
+        }
+      ],
+      "models": [
+        {
+          "name": "<ModelName in PascalCase>",
+          "description": "<one sentence purpose>",
+          "table_name": "<snake_case table name or null>",
+          "fields": [
+            {
+              "name": "<camelCase field name>",
+              "type": "<string|integer|float|decimal|boolean|date|datetime|time|text|json|uuid|enum|file_path|foreign_key>",
+              "required": true,
+              "unique": false,
+              "default": "<or null>",
+              "enum_values": ["<v1>", "<v2>"],
+              "max_length": "<or null>",
+              "notes": "<constraints, format rules, or null>"
+            }
+          ],
+          "relationships": [
+            {
+              "type": "<one_to_one | one_to_many | many_to_many>",
+              "target_model": "<ModelName>",
+              "foreign_key": "<field name or null>",
+              "description": "<nature of the relationship>"
+            }
+          ],
+          "indexes": ["<field or composite field combination to index, if doc mentions>"],
+          "soft_delete": "<true if doc mentions soft-delete / deactivation, else false>"
+        }
+      ],
+      "business_logic": [
+        {
+          "rule": "<plain English description of the business rule>",
+          "trigger": "<what event or action invokes this rule, or null>",
+          "affected_entities": ["<model name or field name>"],
+          "enforcement": "<database | application | both>"
+        }
+      ],
+      "workflows": [
+        {
+          "name": "<workflow name>",
+          "trigger": "<event or API call that starts it>",
+          "steps": ["<step 1>", "<step 2>"],
+          "outcome": "<expected system state after completion>",
+          "rollback": "<what happens on failure, or null>"
+        }
+      ]
+    }
+  }
+
+  ──────────────────────────────────────────────
+  COMPLETENESS CHECKLIST — verify before returning
+  ──────────────────────────────────────────────
+  1.  Every CRUD operation described → a corresponding endpoint.
+  2.  Every data entity / noun → a model with ALL its fields.
+  3.  Every status field → enum_values with ALL values listed.
+  4.  Every relationship mentioned → relationships array entry.
+  5.  Every request parameter, body field, query param → captured with type + validation.
+  6.  Every authentication / authorization rule → set on the endpoint.
+  7.  Every uniqueness / constraint rule → in business_logic AND field notes.
+  8.  Every status-transition rule → in business_logic workflow.
+  9.  Every cascading side-effect → in business_logic.
+  10. Every notification or email trigger → in business_logic or workflows.
+  11. Every import / export / batch process → in workflows.
+  12. Nothing invented beyond what the document states.
+
+user_template: |
+  Module: {module_name}
+
+  Document section text:
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  {module_text}
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Extraction reminders:
+  • Derive endpoints from user actions described ("can add", "can view", "can approve", etc.).
+  • Capture ALL model fields with types, ALL enum values, ALL validation rules.
+  • Record status-transition rules and cascading side-effects in business_logic.
+  • Record approval chains, import/export pipelines, notification flows in workflows.
+  • authentication and authorization must be set on every endpoint that requires it.
+  • Add only what the document states or directly implies. Invent nothing.
+
+  Return valid JSON only. No markdown fences. No text before or after.

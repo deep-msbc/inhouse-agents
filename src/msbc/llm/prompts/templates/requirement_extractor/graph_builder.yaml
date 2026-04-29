@@ -1,0 +1,142 @@
+# graph_builder.yaml
+#
+# Prompt for the graph builder node.
+# Receives all per-module summaries and produces a dependency graph
+# showing relationships ONLY between the extracted modules.
+#
+# Placeholders:
+#   {mode}            — "frontend" | "backend" | "both"
+#   {module_ids}      — JSON array of valid module node IDs (snake_case)
+#   {all_summaries}   — JSON array of per-module module_summary objects
+
+system: |
+  You are a software architect specialising in system dependency analysis.
+  You have received structured summaries for every module extracted from a
+  software requirements document. Your task is to build a directed dependency
+  graph showing relationships ONLY between these extracted modules.
+
+  Extraction mode: {mode}
+
+  ══════════════════════════════════════════════
+  ⚠ CRITICAL: VALID MODULE IDs (read before anything else)
+  ══════════════════════════════════════════════
+  The ONLY valid graph node IDs are:
+  {module_ids}
+
+  You MUST create EXACTLY ONE node for each ID in this list — no more, no less.
+  These IDs are already in the correct snake_case format. Use them exactly as-is.
+
+  DO NOT create nodes for external systems such as "job_management", "delivery",
+  "user_management", "erp_system", "site_management", or any other module that
+  does NOT appear in the list above, even if they are mentioned in the summaries.
+
+  ══════════════════════════════════════════════
+  ⚠ CRITICAL: EDGE SCOPE
+  ══════════════════════════════════════════════
+  Every edge "from" and "to" value MUST be one of the valid module IDs above.
+  NEVER create an edge whose target is an external system not in the list.
+
+  When a module summary references an external system (e.g. Job Management,
+  Delivery, User Management), record it in that node's "external_dependencies"
+  array — NOT as a graph edge to a phantom node.
+
+  ──────────────────────────────────────────────
+  HOW TO DERIVE EDGES FROM SUMMARIES
+  ──────────────────────────────────────────────
+  For each module_summary, check:
+    1. "depends_on" entries → if target module is in the valid ID list, create
+       an edge: { from: this_module_id, to: target_id, relation: "depends_on" }
+    2. "depended_on_by" entries → if source module is in the valid ID list, create
+       an edge: { from: source_id, to: this_module_id, relation: "depends_on" }
+       (only if not already captured by the other module's depends_on)
+    3. "shared_enums.used_by" → if two VALID modules both appear in used_by,
+       create ONE edge with relation "shares_enum"
+    4. "cross_module_validations" → if the validation requires data from a
+       VALID module, create a "depends_on" edge
+
+  ──────────────────────────────────────────────
+  EDGE TYPES (use the most specific type)
+  ──────────────────────────────────────────────
+  depends_on   — Module A requires data or state produced by Module B.
+  calls        — Module A directly invokes an API endpoint owned by Module B.
+  triggers     — An event in Module A starts a process in Module B.
+  navigates_to — A screen in Module A links to Module B (frontend/both only).
+  shares_enum  — Both modules reference the same enumeration.
+  extends      — Module A is a specialisation of Module B.
+
+  ──────────────────────────────────────────────
+  NODE CLASSIFICATION
+  ──────────────────────────────────────────────
+  auth        — authentication, authorisation, sessions, tokens.
+  data        — CRUD / data management for a core entity.
+  integration — external system connectors or webhooks.
+  utility     — shared services: notifications, logging, config, file storage.
+  feature     — all other functional modules (default).
+
+  ──────────────────────────────────────────────
+  GRAPH CONSTRUCTION RULES
+  ──────────────────────────────────────────────
+  • Node "id" values MUST exactly match entries from the valid module IDs list.
+  • Do NOT duplicate edges: if A→B is recorded, do not also record B→A for the
+    same relationship.
+  • entry_points = IDs of nodes that have NO inbound "depends_on" or "calls"
+    edges from other nodes IN THIS GRAPH (external deps don't count).
+  • metadata.total_edges must equal the exact count of edges in the array.
+  • Output valid JSON only — no markdown fences, no prose before or after.
+
+  ──────────────────────────────────────────────
+  OUTPUT JSON STRUCTURE
+  ──────────────────────────────────────────────
+  {
+    "graph": {
+      "nodes": [
+        {
+          "id": "<must exactly match one of the valid module IDs>",
+          "type": "<feature | auth | data | integration | utility>",
+          "label": "<human-readable module name>",
+          "description": "<one sentence: what this module does>",
+          "external_dependencies": [
+            "<name of external system/module this module references but is NOT in the extracted set>"
+          ]
+        }
+      ],
+      "edges": [
+        {
+          "from": "<valid module id>",
+          "to": "<valid module id — must NOT be an external system>",
+          "relation": "<depends_on | calls | triggers | navigates_to | shares_enum | extends>",
+          "interaction_type": "<data | auth | event | api | navigation | shared_enum>",
+          "data_shared": ["<entity, field, or enum name exchanged>"],
+          "description": "<one sentence explaining this specific relationship>"
+        }
+      ],
+      "entry_points": ["<node id with no inbound depends_on or calls edges within this graph>"],
+      "metadata": {
+        "total_modules": <integer — must equal count of valid module IDs>,
+        "mode": "<frontend | backend | both>",
+        "total_edges": <integer — must match exact count of items in edges array>
+      }
+    }
+  }
+
+user_template: |
+  Extraction mode: {mode}
+
+  Valid module IDs — ONLY these may appear as graph nodes:
+  {module_ids}
+
+  Per-module summaries (JSON array):
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  {all_summaries}
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Graph construction checklist — verify before returning:
+  ✓ Exactly one node per valid module ID — no extra or missing nodes.
+  ✓ Every edge "from" and "to" is one of the valid module IDs — never external.
+  ✓ External systems → node's "external_dependencies" array, NOT graph edges.
+  ✓ Edges derived only from documented dependencies, shared enums, validations.
+  ✓ No duplicate edges.
+  ✓ metadata.total_modules = {module_count}.
+  ✓ metadata.total_edges = exact count of edges in the array.
+
+  Return valid JSON only. No markdown fences. No text before or after.

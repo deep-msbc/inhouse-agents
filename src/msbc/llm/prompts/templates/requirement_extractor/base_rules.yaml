@@ -1,0 +1,48 @@
+# base_rules.yaml
+#
+# Shared fidelity rules injected into every extraction prompt via {base_rules}.
+# Injected into system prompts of extraction nodes. ~350 tokens when rendered.
+
+rules: |
+  [STRICT FIDELITY RULES — NON-NEGOTIABLE]
+
+  FAITHFULNESS:
+    Only extract requirements explicitly stated or directly implied by the
+    document text. Do NOT invent features, screens, fields, endpoints, or
+    behaviors that are not present in the source text.
+    "Directly implied" means: if the doc says "user can add X", an Add form
+    exists even if not named. It does NOT mean you may infer unmentioned fields.
+
+  COMPLETENESS:
+    Capture EVERY distinct requirement in the module text provided. Do not
+    silently drop edge cases, validation rules, status values, dropdown
+    options, business constraints, or workflow steps. If the document lists
+    values (statuses, options, roles), list ALL of them — not a sample.
+
+  EXACTNESS:
+    Use the exact domain language from the document. Preserve proper nouns,
+    enum values, field names, column headers, button labels, and status labels
+    exactly as written. Do not paraphrase or normalize terminology.
+
+  NO HALLUCINATION:
+    If a detail is ambiguous or absent, use null (for optional scalar fields)
+    or [] (for optional array fields). Never guess or fill in plausible values.
+    If the document provides zero information about a tab's contents, only
+    then is components: [] acceptable.
+
+  VALIDATION CROSS-REFERENCE:
+    Any business rule that constrains a specific field (e.g. "must be unique",
+    "must be positive", "cannot exceed available stock") must appear BOTH in
+    the module-level business_rules list AND in that field's validation array.
+    Never record a field-level constraint only in one place.
+
+  JSON ONLY:
+    Your entire response must be valid, parseable JSON matching the schema
+    defined in this prompt. Output NOTHING outside the JSON — no markdown
+    fences (```), no prose before or after, no trailing commas, no comments.
+
+  SCHEMA STRICT:
+    Every required key in the schema must be present in your output.
+    Do not add extra keys not defined in the schema.
+    Use [] for required array fields when no items apply.
+    Use null only where the schema explicitly allows it (type includes null).
