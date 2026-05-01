@@ -25,12 +25,27 @@ from src.msbc.config import (
     API_RETRY_ATTEMPTS,
     API_RETRY_BASE_DELAY,
     JSON_MODE_SUPPORTED_PREFIXES,
+    LLM_MAX_CONCURRENCY,
     MODEL_PRICING,
     RETRYABLE_STATUS_CODES,
     SCHEMA_VALIDATION_RETRIES,
 )
 
 logger = logging.getLogger(__name__)
+
+# ── Global concurrency gate ──────────────────────────────────────────────────
+# Caps the number of simultaneous OpenAI API calls across all background jobs.
+# Default is 15 — enough for one full job (5 modules × 3 calls) with no queuing.
+# Lazily initialized on first use so LLM_MAX_CONCURRENCY env-var overrides apply.
+_llm_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Return (and lazily create) the module-level LLM concurrency semaphore."""
+    global _llm_semaphore
+    if _llm_semaphore is None:
+        _llm_semaphore = asyncio.Semaphore(LLM_MAX_CONCURRENCY)
+    return _llm_semaphore
 
 # ── Tokenizer ─────────────────────────────────────────────────────────────────
 
@@ -102,43 +117,63 @@ async def call_llm(
     Returns:
         (content_str, usage_dict)
     """
-    llm = _build_llm()
-    messages = [
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=user_prompt),
-    ]
+    async with _get_semaphore():
+        llm = _build_llm()
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt),
+        ]
 
-    last_exc: Exception | None = None
-    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
-        try:
-            response = await llm.ainvoke(messages)
-            content = response.content or ""
-            usage_meta = response.response_metadata.get("token_usage", {})
-            usage = _calculate_cost(
-                settings.LLM_MODEL,
-                usage_meta.get("prompt_tokens",
-                               count_tokens(system_prompt + user_prompt)),
-                usage_meta.get("completion_tokens", count_tokens(content)),
-            )
-            return content, usage
+        last_exc: Exception | None = None
+        for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+            try:
+                # asyncio.wait_for enforces a hard wall-clock deadline independent
+                # of httpx timeouts, which only apply per-read-chunk and can be
+                # bypassed by slow-streaming responses.
+                response = await asyncio.wait_for(
+                    llm.ainvoke(messages),
+                    timeout=settings.LLM_TIMEOUT,
+                )
+                content = response.content or ""
+                usage_meta = response.response_metadata.get("token_usage", {})
+                usage = _calculate_cost(
+                    settings.LLM_MODEL,
+                    usage_meta.get("prompt_tokens",
+                                   count_tokens(system_prompt + user_prompt)),
+                    usage_meta.get("completion_tokens", count_tokens(content)),
+                )
+                return content, usage
 
-        except Exception as exc:
-            last_exc = exc
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            retryable = (status in RETRYABLE_STATUS_CODES) if status else True
-            if not retryable or attempt >= API_RETRY_ATTEMPTS:
-                raise
+            except asyncio.TimeoutError:
+                last_exc = RuntimeError(
+                    f"LLM call timed out after {settings.LLM_TIMEOUT}s"
+                )
+                if attempt >= API_RETRY_ATTEMPTS:
+                    raise last_exc
+                delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "LLM call timed out (attempt %d/%d, limit=%ds) — retrying in %.1fs.",
+                    attempt, API_RETRY_ATTEMPTS, settings.LLM_TIMEOUT, delay,
+                )
+                await asyncio.sleep(delay)
 
-            delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
-            logger.warning(
-                "LLM call failed (attempt %d/%d): %s — retrying in %.1fs.",
-                attempt, API_RETRY_ATTEMPTS, exc, delay,
-            )
-            await asyncio.sleep(delay)
+            except Exception as exc:
+                last_exc = exc
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                retryable = (status in RETRYABLE_STATUS_CODES) if status else True
+                if not retryable or attempt >= API_RETRY_ATTEMPTS:
+                    raise
 
-    raise RuntimeError(
-        f"LLM call failed after {API_RETRY_ATTEMPTS} attempts: {last_exc}"
-    )
+                delay = API_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.warning(
+                    "LLM call failed (attempt %d/%d): %s — retrying in %.1fs.",
+                    attempt, API_RETRY_ATTEMPTS, exc, delay,
+                )
+                await asyncio.sleep(delay)
+
+        raise RuntimeError(
+            f"LLM call failed after {API_RETRY_ATTEMPTS} attempts: {last_exc}"
+        )
 
 
 # ── JSON parsing ──────────────────────────────────────────────────────────────

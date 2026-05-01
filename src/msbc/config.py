@@ -12,7 +12,7 @@ from app.core.config import settings  # FastAPI settings (env vars)
 
 # ── Token budget ──────────────────────────────────────────────────────────────
 # Hard cap on (system_prompt + user_prompt + doc_text) tokens per LLM call.
-TOTAL_INPUT_TOKEN_LIMIT: int = 10000  # 10k tokens; we reserve some headroom for the model's response.
+TOTAL_INPUT_TOKEN_LIMIT: int = 12000   # lower threshold triggers chunking sooner for large modules
 
 # Maximum tokens reserved for system + user prompt templates (excluding doc text).
 # Available for module text per call ≈ TOTAL_INPUT_TOKEN_LIMIT - PROMPT_MAX_TOKENS
@@ -60,6 +60,44 @@ JSON_MODE_SUPPORTED_PREFIXES: tuple[str, ...] = (
     "gpt-3.5-turbo-1106",
     "gpt-3.5-turbo-0125",
 )
+
+# ── LLM concurrency ──────────────────────────────────────────────────────────
+# Global cap on simultaneous OpenAI API calls.
+# Within a single job, up to (modules × calls_per_module) coroutines race the
+# semaphore at once.  With 5 modules × 3 calls = 15 calls, a limit of 5 would
+# force ~3 serial rounds, adding up to 2×avg_call_time of queue-wait to every
+# late-starting module — causing MODULE_EXTRACTION_TIMEOUT to fire before the
+# module’s calls even get a chance to run.
+# Set to 15 so all calls within a typical single job (up to 5 modules) proceed
+# in parallel.  For multi-job overlap protection raise LLM_MAX_CONCURRENCY or
+# rely on OpenAI’s own rate-limiter (which returns 429, already retried).
+try:
+    import os as _os
+    LLM_MAX_CONCURRENCY: int = int(_os.environ.get("LLM_MAX_CONCURRENCY", "15"))
+except (ValueError, TypeError):
+    LLM_MAX_CONCURRENCY = 15
+
+# ── Per-module extraction timeout ────────────────────────────────────────────
+# Hard deadline (seconds) for the entire extract_module_node coroutine,
+# covering all parallel LLM calls (fe + be + summary) plus retries.
+# With LLM_MAX_CONCURRENCY raised to avoid queue-wait, worst-case is:
+#   SCHEMA_VALIDATION_RETRIES(3) × LLM_TIMEOUT(120s) = 360s per call slot.
+# Set to 600s to give genuine OpenAI slowness + retry budget room.
+try:
+    MODULE_EXTRACTION_TIMEOUT: int = int(_os.environ.get("MODULE_EXTRACTION_TIMEOUT", "600"))
+except (ValueError, TypeError):
+    MODULE_EXTRACTION_TIMEOUT = 600
+
+# ── Per-module extraction concurrency cap ─────────────────────────────────────
+# The Send fan-out in build_slices_node fires all N modules in parallel.
+# MODULE_BATCH_SIZE limits how many extract_module_node coroutines run at once,
+# preventing the rate-limit cascade that causes timeouts on large documents.
+# With MODULE_BATCH_SIZE=3 and Phase-4 sequential FE/BE (N+1 peak per module):
+#   worst-case simultaneous LLM calls ≈ 3 × (N_chunks + 1) ≤ ~12 per batch.
+try:
+    MODULE_BATCH_SIZE: int = int(_os.environ.get("MODULE_BATCH_SIZE", "3"))
+except (ValueError, TypeError):
+    MODULE_BATCH_SIZE = 3
 
 # ── Convenience re-exports from app-level settings ────────────────────────────
 # Centralise access so other module files can import from one place.

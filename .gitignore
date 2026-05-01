@@ -7,6 +7,7 @@ wheels/
 *.egg-info
 
 # Virtual environments
+venv/
 .venv
 .env
 *.db
@@ -28,4 +29,10 @@ SKELETON/
 # Unwanted README files
 CODEBASE_OVERVIEW.md
 CODEBASE_INDEX.json
-scratch_files.txt
+scratch_files.txtuser_stories/
+responses/
+user_story_parser/
+user_stories/
+
+*.kuzu
+*.json
