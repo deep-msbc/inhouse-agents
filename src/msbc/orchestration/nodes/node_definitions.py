@@ -19,10 +19,10 @@ import yaml
 
 from src.msbc.agents.schemas.requirement_extractor import (
     BACKEND_SCHEMA,
+    CLASSIFICATION_SCHEMA,
     COMBINED_SCHEMA,
     FRONTEND_SCHEMA,
     GRAPH_OUTPUT_SCHEMA,
-    SEGMENTATION_SCHEMA,
     SUMMARY_SCHEMA,
 )
 from src.msbc.llm.clients.openai_client import call_llm_with_schema, count_tokens, merge_usage
@@ -283,186 +283,333 @@ def _normalize_extraction(data: dict[str, Any]) -> dict[str, Any]:
 
 # ── Phase 0: Segmentation ─────────────────────────────────────────────────────
 
-def _extract_seed_modules(
-    document_text: str,
-    heading_hierarchy: list[dict] | None = None,
-) -> list[str]:
+def _pre_clean_headings(heading_hierarchy: list[dict]) -> list[dict]:
     """
-    Detect top-level module boundaries for the segmentation prompt.
+    Lightweight Python pre-cleanup before the LLM holistic module selection call.
 
-    Works for every ERP document structure:
+    Python's job is ONLY to remove obvious structural noise — blank entries,
+    excessively long paragraphs accidentally tagged as headings, emoji-prefixed
+    decorative callouts, and field-label headings (e.g. "Module Name: X").
+    All semantic decisions (module vs. sub-section vs. UI element) are delegated
+    entirely to the LLM so that genuine module headings are never silently dropped.
 
-    Primary path — heading_hierarchy available (preferred):
-        Step 1 — find the shallowest heading level (min_level).
-        Step 2 — if only ONE heading exists at min_level it is a document title;
-                  the real module boundary level is min_level + 1.
-        Step 3 — collect every heading at module_level EXCEPT dotted sub-sections
-                  whose prefix contains an embedded dot (e.g. "2.1", "2.1.1",
-                  "3.4.5").  This means:
-                    ✓  "8. Material Issue With Job"   (plain integer prefix)
-                    ✓  "Step 1 – Purchase Order Creation"
-                    ✓  "Phase 2 – GRN / Material Inward"
-                    ✓  "Hardware Tab"
-                    ✗  "2.1 Material Requisition Against Secured Job"
-                    ✗  "4.15 Business Rules"
+    Filters applied (in order):
+      1. Blank headings removed.
+      2. Top three heading levels are kept — deeper levels (L4+) are very rarely
+         module boundaries but L3 can contain named masters or process steps.
+      3. Headings > 150 characters removed — these are paragraphs accidentally
+         formatted as headings in Word (real titles are short).
+      4. Emoji / symbol starters removed (U+2600+) — decorative section markers.
+      5. Explicit field-label headings removed — "Module Name: X", "Section Title: Y".
+      6. Deduplicated by exact text (first occurrence wins).
 
-    Fallback path — heading_hierarchy absent:
-        Scans raw Markdown text for lines starting with exactly one ``#``
-        followed by a plain-integer numbered title (``# 8. Material Issue``).
-        Level-2+ lines such as ``## 2.1 Purpose`` are excluded.
+    Intentionally NOT filtered here (let the LLM decide):
+      • Dotted sub-sections ("2.1 Purpose", "3.4 Business Rules") — the LLM
+        prompt explicitly excludes them, but they provide useful structural
+        context for adjacent headings.
+      • Broad document-title headings ("Job Module") — LLM rules handle them.
+      • UI component names ("Filter Panel") — LLM rules handle them.
 
-    Returns:
-        Ordered list of heading texts that form hard module boundaries.
-        Empty list when no qualifying headings are found.
+    Returns a new list of heading dicts (same shape: {level, text}).
     """
     import re as _re
 
-    # Dotted sub-section prefix: "2.1 …", "2.1.1 …", "3.4.5 …"
-    # These are ALWAYS internal to a parent module, never a module boundary.
-    _dotted_sub_re = _re.compile(r"^\d+\.\d+")
+    if not heading_hierarchy:
+        return []
 
-    seen:  set[str]  = set()
-    seeds: list[str] = []
-
-    if heading_hierarchy:
-        # ── Step 1: find shallowest level ────────────────────────────────────
-        all_levels = [
-            h.get("level", 99)
-            for h in heading_hierarchy
-            if (h.get("text") or "").strip()
-        ]
-        if not all_levels:
-            return []
-        min_level = min(all_levels)
-
-        # ── Step 2: single heading at min_level → it is the document title ───
-        headings_at_min = [
-            h for h in heading_hierarchy
-            if h.get("level", 99) == min_level and (h.get("text") or "").strip()
-        ]
-        module_level = (min_level + 1) if len(headings_at_min) <= 1 else min_level
-
-        # ── Step 3: collect every heading at module_level that is not a
-        #            dotted sub-section ─────────────────────────────────────────
-        for h in heading_hierarchy:
-            if h.get("level", 99) != module_level:
-                continue
-            text = (h.get("text") or "").strip()
-            if not text:
-                continue
-            if _dotted_sub_re.match(text):
-                continue   # "2.1 …", "4.15 …" — sub-section, not a module
-            if text not in seen:
-                seen.add(text)
-                seeds.append(text)
-        return seeds
-
-    # ── Fallback path: raw Markdown text scan ────────────────────────────────
-    # Require exactly one leading "#" (level-1 Markdown) so that "## 2.1 …"
-    # lines are excluded.  Only plain-integer prefixed titles qualify.
-    pattern = _re.compile(
-        r"^#\s+(\d+\.\s+[A-Z\u0080-\uFFFF][^\n]{2,80})",
-        _re.MULTILINE,
+    _label_re = _re.compile(
+        r"^(module\s*(name|no\.?|number|title)|section\s+title)\s*[:—\-]",
+        _re.IGNORECASE,
     )
-    for m in pattern.finditer(document_text):
-        heading = m.group(1).strip()
-        # Skip dotted sub-sections that somehow end up as level-1 Markdown
-        if _dotted_sub_re.match(heading):
+
+    # Determine the three shallowest levels present so L3 masters/steps are included.
+    all_levels = sorted({
+        h.get("level", 99)
+        for h in heading_hierarchy
+        if (h.get("text") or "").strip()
+    })
+    keep_levels: set[int] = set(all_levels[:3])
+
+    seen: set[str] = set()
+    cleaned: list[dict] = []
+
+    for h in heading_hierarchy:
+        level = h.get("level", 99)
+        text  = (h.get("text") or "").strip()
+
+        if not text:
             continue
-        if heading not in seen:
-            seen.add(heading)
-            seeds.append(heading)
-    return seeds
+        if level not in keep_levels:
+            continue
+        if len(text) > 150:
+            continue
+        if ord(text[0]) >= 0x2600:
+            continue
+        if _label_re.match(text):
+            continue
+        if text in seen:
+            continue
+
+        seen.add(text)
+        cleaned.append({"level": level, "text": text})
+
+    logger.info(
+        "_pre_clean_headings: %d of %d heading(s) kept after pre-clean "
+        "(levels kept: %s).",
+        len(cleaned), len(heading_hierarchy), sorted(keep_levels),
+    )
+    return cleaned
+
+
+def _heading_to_module_name(heading: str) -> str:
+    """
+    Derive a clean 2-6 word module name from a raw heading string when the
+    LLM does not provide one.  Strips leading number prefixes and parenthetical
+    suffixes like "(Final Document)", "(FINAL – WITH BATCH LAYER)".
+
+    Examples:
+      "8. Material Issue With Job"                 → "Material Issue With Job"
+      "Step 1 – How Purchase Order is Created"     → "How Purchase Order is Created"
+      "Material Consumption (Against Job) – Final" → "Material Consumption"
+    """
+    import re as _re
+
+    name = heading.strip()
+    name = _re.sub(r"^\d+\.\s*", "", name)
+    name = _re.sub(r"^(Step|Phase|Stage)\s+\d+\s*[–\-]\s*", "", name, flags=_re.IGNORECASE)
+    name = _re.sub(
+        r"\s*[\(–\-].*?(final|document|updated|complete|version)[^\)]*\)?$",
+        "", name, flags=_re.IGNORECASE,
+    ).strip()
+    name = name.rstrip("–-— ").strip()
+    return name or heading[:50]
+
+
+def _select_module_candidates(cleaned_headings: list[dict]) -> list[dict]:
+    """
+    Reduce pre-cleaned headings to structural module candidates before the LLM call.
+
+    Real modules are "container" headings — they own multiple sub-sections below
+    them.  Leaf sections (Validation Rules, Business Rules, Save Logic, etc.) have
+    zero sub-headings and must never reach the LLM.
+
+    Algorithm (two passes):
+      Pass 1 — Level selection:
+        Walk levels from shallowest to deepest.
+        Skip singleton levels (1 heading = document title).
+        Return the first level whose heading count is in [2, MAX_MODULE_COUNT].
+        This handles the common case: the shallowest non-singleton level is
+        exactly the module level (e.g. 5 L1 headings for 5 top-level modules).
+
+      Pass 2 — Sub-heading count filter (only when Pass 1 level has > MAX_MODULE_COUNT):
+        Among headings at the overcrowded level, keep only those with >= MIN_CHILDREN
+        sub-headings immediately below them.  Leaf / near-leaf sections are excluded.
+
+      Fallback: return all cleaned headings so the pipeline can still proceed.
+
+    Typical result: 3–20 candidates instead of 100–200, making LLM classification
+    accurate and fast.
+    """
+    import collections as _col
+
+    MAX_MODULE_COUNT = 25
+    MIN_CHILDREN     = 4
+
+    if not cleaned_headings:
+        return cleaned_headings
+
+    n = len(cleaned_headings)
+
+    by_level: dict[int, list[dict]] = _col.defaultdict(list)
+    for h in cleaned_headings:
+        by_level[h["level"]].append(h)
+
+    # Pre-compute each heading's index for O(1) position lookup
+    pos_map: dict[int, int] = {id(h): i for i, h in enumerate(cleaned_headings)}
+
+    def _child_count(h: dict) -> int:
+        """Count sub-headings that follow h before the next sibling/parent heading."""
+        start = pos_map[id(h)]
+        level = h["level"]
+        count = 0
+        for j in range(start + 1, n):
+            if cleaned_headings[j]["level"] <= level:
+                break
+            count += 1
+        return count
+
+    for level in sorted(by_level.keys()):
+        headings_at_level = by_level[level]
+        count = len(headings_at_level)
+
+        if count <= 1:
+            # Singleton = document title; skip to the next (deeper) level.
+            continue
+
+        if count <= MAX_MODULE_COUNT:
+            # Perfect module count — use this level directly.
+            logger.info(
+                "_select_module_candidates: L%d — %d heading(s) selected.",
+                level, count,
+            )
+            return headings_at_level
+
+        # More than MAX_MODULE_COUNT headings at this level.
+        # Filter to structural containers (>= MIN_CHILDREN sub-headings).
+        filtered = [h for h in headings_at_level if _child_count(h) >= MIN_CHILDREN]
+
+        if len(filtered) >= 2:
+            logger.info(
+                "_select_module_candidates: L%d — %d candidate(s) "
+                "(filtered from %d, min %d children).",
+                level, len(filtered), count, MIN_CHILDREN,
+            )
+            return filtered
+
+        # Fewer than 2 containers at this level — try the next deeper level.
+
+    logger.info(
+        "_select_module_candidates: fallback — using all %d cleaned heading(s).",
+        len(cleaned_headings),
+    )
+    return cleaned_headings
 
 
 async def segmentation_node(state: ExtractionState) -> dict[str, Any]:
     """
-    Identify top-level modules from the heading hierarchy.
+    Identify top-level modules using structural pre-filtering + LLM classification.
 
-    Before calling the LLM, Python pre-segmentation scans the raw document
-    text for top-level numbered sections (e.g. "8. Material Issue With Job").
-    These become guaranteed module boundaries injected into the prompt as
-    seed_modules — the LLM cannot merge them.
-
-    Mirrors Phase 0 of the original llm_service.py.
+    Strategy:
+      1. Python pre-clean: remove structural noise (blank, too long, emoji,
+         field-label headings). Top-3 heading levels kept.
+      2. Structural candidate selection: from ~100-200 cleaned headings, keep
+         only those that are structural containers — the shallowest heading level
+         with 2-25 entries, or (when a level is overcrowded) only the headings
+         at that level with >= 4 direct sub-headings.  Leaf sections like
+         "Business Rules", "Validation Rules", "Save Logic" are dropped here
+         without ever reaching the LLM.  Result: 3-25 candidates.
+      3. LLM classification: receives 3-25 candidates and classifies each as
+         MODULE or IGNORE.  Small input = accurate decisions.
+      4. Python filter: keep only MODULE headings, enforce document order.
+      5. Fallback: if no MODULE headings found, treat whole document as one module.
     """
-    logger.info("segmentation_node: identifying modules from heading hierarchy.")
+    logger.info("segmentation_node: classifying headings via LLM.")
     prompt_data = _load_prompt("segmentation")
 
-    # ── Python pre-segmentation: detect guaranteed module boundaries ──────────
-    document_text: str = state.get("document_text", "")
-    seed_headings = _extract_seed_modules(document_text, state.get("heading_hierarchy"))
+    # ── Step 1: Python pre-clean ──────────────────────────────────────────────
+    heading_hierarchy: list[dict] = state.get("heading_hierarchy") or []
+    cleaned_headings = _pre_clean_headings(heading_hierarchy)
 
-    if seed_headings:
-        logger.info(
-            "segmentation_node: %d seed module(s) detected by Python pre-scan: %s",
-            len(seed_headings), seed_headings,
+    if not cleaned_headings:
+        logger.warning(
+            "segmentation_node: no headings after pre-clean; "
+            "falling back to single-module."
         )
-        seed_block = (
-            "GUARANTEED MODULE BOUNDARIES — you MUST keep each as its own module"
-            " (never merge two together):\n"
-            + "\n".join(f"  - {h}" for h in seed_headings)
-            + "\n"
-        )
-    else:
-        seed_block = ""
+        return {
+            "modules": [{
+                "name": "Application",
+                "heading": "",
+                "level": 1,
+                "description": "Full document",
+            }],
+            "all_usage": [],
+        }
 
-    # ── Build and send the segmentation prompt ────────────────────────────────
-    heading_hierarchy_json = json.dumps(state["heading_hierarchy"], indent=2)
+    # ── Step 1b: Structural candidate selection ───────────────────────────────
+    # Reduces 100-200 cleaned headings to 3-25 structural module candidates.
+    # Only headings that "own" multiple sub-sections are module candidates;
+    # leaf sections (Business Rules, Validation Rules, Save Logic, …) are dropped.
+    # The position_index is built from the full cleaned list so document order
+    # is preserved correctly even though the LLM receives only the candidates.
+    candidates = _select_module_candidates(cleaned_headings)
+
+    # ── Step 2: Build heading list for LLM ────────────────────────────────────
+    position_index: dict[str, int] = {}
+    for pos, h in enumerate(cleaned_headings):     # full list for accurate ordering
+        text = h["text"]
+        if text not in position_index:
+            position_index[text] = pos
+
+    heading_lines: list[str] = [
+        f"[L{h['level']}] {h['text']}" for h in candidates
+    ]
+    heading_list_text = "\n".join(heading_lines)
+    heading_count = len(candidates)
+
     user_prompt = _fmt(
         prompt_data["user_template"],
-        heading_hierarchy=heading_hierarchy_json,
-        seed_modules=seed_block,
+        heading_list=heading_list_text,
+        heading_count=str(heading_count),
     )
 
+    logger.info(
+        "segmentation_node: classifying %d candidate(s) (from %d cleaned) with LLM.",
+        heading_count, len(cleaned_headings),
+    )
+
+    # ── Step 3: LLM per-heading classification ────────────────────────────────
+    # CLASSIFICATION_SCHEMA — LLM returns [{heading, type, module_name, description}]
+    # for every input heading.  Python keeps only type=="MODULE".
     result, usages = await call_llm_with_schema(
         system_prompt=prompt_data["system"],
         user_prompt=user_prompt,
-        schema=SEGMENTATION_SCHEMA,
-        schema_name="segmentation",
+        schema=CLASSIFICATION_SCHEMA,
+        schema_name="segmentation_classify",
     )
 
-    modules: list[dict[str, Any]] = result.get("modules", [])
+    classifications: list[dict] = result.get("classifications", [])
 
-    # ── Guarantee seed modules are present in the result ─────────────────────
-    # If the LLM dropped any seed module, inject it back so slicing still works.
-    if seed_headings and modules:
-        existing_headings = {m.get("heading", "").strip() for m in modules}
-        for seed in seed_headings:
-            if seed not in existing_headings:
-                logger.warning(
-                    "segmentation_node: LLM dropped seed module '%s'; re-injecting.",
-                    seed,
-                )
-                modules.append({
-                    "name": seed.split(".", 1)[-1].strip()[:50],
-                    "heading": seed,
-                    "level": 2,
-                    "description": f"Requirements for {seed}",
-                })
+    # ── Step 4: Filter MODULE headings, enrich, enforce document order ─────────
+    level_by_heading: dict[str, int] = {h["text"]: h["level"] for h in cleaned_headings}
+    seen_headings: set[str] = set()
+    enriched: list[dict[str, Any]] = []
 
-    # ── Post-processing: strip dotted sub-section modules ────────────────────
-    # The LLM sometimes emits modules for headings like "2.1 Material
-    # Requisition Against Secured Job" or "4.15 Business Rules".  These are
-    # always sub-sections WITHIN a parent module, never stand-alone modules.
-    # Remove any module whose heading OR name starts with a dotted-sub prefix.
-    import re as _re
-    _dotted_sub_re = _re.compile(r"^\d+\.\d+")
-    before_filter = len(modules)
-    modules = [
-        m for m in modules
-        if not _dotted_sub_re.match(m.get("heading", "") or m.get("name", "") or "")
+    for item in classifications:
+        if item.get("type") != "MODULE":
+            continue
+
+        heading = (item.get("heading") or "").strip()
+        if not heading or heading in seen_headings:
+            continue
+        seen_headings.add(heading)
+
+        # Use LLM-provided name; fall back to heuristic if blank or too long
+        name = (item.get("module_name") or "").strip()
+        if not name or len(name.split()) > 8:
+            name = _heading_to_module_name(heading)
+
+        desc = (item.get("description") or "").strip() or f"Requirements for {name}"
+        level = level_by_heading.get(heading, 2)
+
+        # Unrecognised headings (not in cleaned list) go to end
+        doc_pos = position_index.get(heading, 10_000)
+
+        enriched.append({
+            "name":        name,
+            "heading":     heading,
+            "level":       level,
+            "description": desc,
+            "_doc_pos":    doc_pos,
+        })
+
+    # Sort by original document position (critical for correct text slicing)
+    enriched.sort(key=lambda x: x["_doc_pos"])
+
+    modules: list[dict[str, Any]] = [
+        {k: v for k, v in m.items() if k != "_doc_pos"}
+        for m in enriched
     ]
-    if len(modules) < before_filter:
-        logger.info(
-            "segmentation_node: removed %d dotted sub-section pseudo-module(s)"
-            " — %d real module(s) remain.",
-            before_filter - len(modules), len(modules),
-        )
 
+    logger.info(
+        "segmentation_node: LLM classified %d candidate(s) → %d MODULE(s).",
+        heading_count, len(modules),
+    )
+
+    # ── Step 5: Fallback ──────────────────────────────────────────────────────
     if not modules:
-        # Fallback: treat the whole document as one module
-        logger.warning("segmentation_node: no modules found; falling back to single module.")
+        logger.warning(
+            "segmentation_node: no MODULE headings found; falling back to single module."
+        )
         modules = [{
             "name": "Application",
             "heading": "",
@@ -471,7 +618,7 @@ async def segmentation_node(state: ExtractionState) -> dict[str, Any]:
         }]
 
     logger.info(
-        "segmentation_node: %d module(s) identified: %s",
+        "segmentation_node: final module list (%d): %s",
         len(modules), [m["name"] for m in modules],
     )
     return {"modules": modules, "all_usage": usages}
