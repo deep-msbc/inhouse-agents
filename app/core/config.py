@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     # ── LLM ───────────────────────────────────────────────────────────────────
     OPENAI_API_KEY: str = ""
     LLM_MODEL: str = "gpt-4.1-mini"
-    LLM_TIMEOUT: int = 120              # seconds per individual LLM call
+    LLM_TIMEOUT: int = 300              # seconds per individual LLM call
 
     # ── Database ──────────────────────────────────────────────────────────────
     DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/devagents"
@@ -40,6 +40,21 @@ class Settings(BaseSettings):
 
     # ── Logging ───────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
+
+    # ── Qdrant ────────────────────────────────────────────────────────────────
+    QDRANT_URL: str = "http://localhost:6333"
+    QDRANT_API_KEY: str = ""
+
+    # ── Embedding ─────────────────────────────────────────────────────────────
+    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-large"
+    EMBEDDING_DIMENSIONS: int = 1536
+
+    # ── Toolkit & Examples Paths ──────────────────────────────────────────────
+    RTK_MONOREPO_PATH: str = ""
+    EXAMPLES_DIR: str = "correct_code_examples"
+
+    # ── KUZU Graph DB ─────────────────────────────────────────────────────────
+    KUZU_DB_PATH: str = "./data/toolkit_graph.kuzu"
 
     model_config = SettingsConfigDict(
         env_file=".env",

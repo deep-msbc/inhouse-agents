@@ -11,6 +11,7 @@ Phases:
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,8 @@ from src.msbc.agents.schemas.requirement_extractor import (
     SEGMENTATION_SCHEMA,
     SUMMARY_SCHEMA,
 )
-from src.msbc.llm.clients.openai_client import call_llm_with_schema, merge_usage
+from src.msbc.llm.clients.openai_client import call_llm_with_schema, count_tokens, merge_usage
+from src.msbc.config import TOTAL_INPUT_TOKEN_LIMIT, PROMPT_MAX_TOKENS, MODULE_EXTRACTION_TIMEOUT, MODULE_BATCH_SIZE
 from src.msbc.orchestration.state import ExtractionState, ModuleResult, ModuleSlice
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,64 @@ def _fmt(template: str, **kwargs: str) -> str:
 
 # ── Document slicing (mirrors _slice_module_text from old llm_service.py) ─────
 
+def _normalize_whitespace(text: str) -> str:
+    """Collapse all runs of whitespace (spaces, tabs, newlines) to a single space."""
+    import re as _re
+    return _re.sub(r"\s+", " ", text).strip()
+
+
+def _find_heading(document_text: str, heading: str) -> int:
+    """
+    Locate *heading* inside *document_text* using three progressively looser passes:
+
+    1. Exact substring match.
+    2. Case-insensitive exact match.
+    3. Whitespace-collapsed case-insensitive match — handles PDF/docx artifacts
+       where the extractor inserts extra spaces, tabs, or stray page numbers
+       between words (e.g. 'Step 1        6 How …' vs 'Step 1 How …').
+
+    Returns the start index, or -1 if none of the passes succeed.
+    """
+    # Pass 1 — exact
+    idx = document_text.find(heading)
+    if idx != -1:
+        return idx
+
+    # Pass 2 — case-insensitive exact
+    idx = document_text.lower().find(heading.lower())
+    if idx != -1:
+        return idx
+
+    # Pass 3 — whitespace-collapsed search
+    # Build a normalised shadow of the document, find the normalised heading,
+    # then map the match position back to the original document.
+    norm_doc     = _normalize_whitespace(document_text)
+    norm_heading = _normalize_whitespace(heading)
+    norm_idx     = norm_doc.lower().find(norm_heading.lower())
+    if norm_idx == -1:
+        return -1
+
+    # Recover approximate position in original document.
+    # Walk the original text, counting non-whitespace chars to match the
+    # normalised offset. This is O(n) but documents are typically < 200k chars.
+    original_pos = 0
+    norm_pos     = 0
+    prev_was_ws  = False
+    for orig_pos, ch in enumerate(document_text):
+        if norm_pos >= norm_idx:
+            return orig_pos
+        if ch in (" ", "\t", "\n", "\r"):
+            if not prev_was_ws:
+                norm_pos    += 1  # collapsed whitespace counts as one space char
+                prev_was_ws  = True
+        else:
+            norm_pos    += 1
+            prev_was_ws  = False
+            original_pos = orig_pos
+
+    return original_pos
+
+
 def _slice_module_text(
     document_text: str,
     module_heading: str,
@@ -70,9 +130,7 @@ def _slice_module_text(
     Returns from module_heading up to (but not including) next_heading, or end of doc.
     Falls back to the full document if the heading is not found.
     """
-    start_idx = document_text.find(module_heading)
-    if start_idx == -1:
-        start_idx = document_text.lower().find(module_heading.lower())
+    start_idx = _find_heading(document_text, module_heading)
     if start_idx == -1:
         logger.warning(
             "Heading '%s' not found in document; using full text as fallback.",
@@ -81,12 +139,10 @@ def _slice_module_text(
         return document_text
 
     if next_heading:
-        end_idx = document_text.find(next_heading, start_idx + len(module_heading))
-        if end_idx == -1:
-            end_idx = document_text.lower().find(
-                next_heading.lower(), start_idx + len(module_heading)
-            )
+        end_idx = _find_heading(document_text[start_idx + len(module_heading):], next_heading)
         if end_idx != -1:
+            # end_idx is relative to the slice — shift back to absolute
+            end_idx += start_idx + len(module_heading)
             return document_text[start_idx:end_idx]
 
     return document_text[start_idx:]
@@ -194,36 +250,169 @@ def _normalize_extraction(data: dict[str, Any]) -> dict[str, Any]:
     """
     Safety-net normalizer: fix component format when the LLM wraps components
     in UPPERCASE named keys instead of emitting flat objects with `type`.
+    Also filters out enums with empty values arrays (schema violation).
     Handles both frontend mode (module.screens) and both mode (module.frontend.screens).
     Applied after JSON parsing and before schema validation on every attempt.
     """
+    module = data.get("module", {})
+
+    # ── Block 1: component unwrapping ────────────────────────────────────────
+    # Isolated so a malformed screen never silently prevents block 2 from running.
     try:
-        module = data.get("module", {})
-        # frontend mode: module.screens
         for screen in module.get("screens", []):
             screen["components"] = _unwrap_components(screen.get("components", []))
-        # both mode: module.frontend.screens
         for screen in module.get("frontend", {}).get("screens", []):
             screen["components"] = _unwrap_components(screen.get("components", []))
     except Exception:
-        pass  # Return data unchanged if normalization itself fails
+        pass  # Return components unchanged if unwrapping fails
+
+    # ── Block 2: enum filtering ───────────────────────────────────────────────
+    # Strip any enum whose values list is empty (schema requires minItems: 1).
+    # Runs unconditionally — independent of block 1.
+    try:
+        if "enums" in module:
+            module["enums"] = [e for e in module["enums"] if e.get("values")]
+        frontend = module.get("frontend", {})
+        if "enums" in frontend:
+            frontend["enums"] = [e for e in frontend["enums"] if e.get("values")]
+    except Exception:
+        pass  # Return enums unchanged if filtering fails
+
     return data
 
 
 # ── Phase 0: Segmentation ─────────────────────────────────────────────────────
 
+def _extract_seed_modules(
+    document_text: str,
+    heading_hierarchy: list[dict] | None = None,
+) -> list[str]:
+    """
+    Detect top-level module boundaries for the segmentation prompt.
+
+    Works for every ERP document structure:
+
+    Primary path — heading_hierarchy available (preferred):
+        Step 1 — find the shallowest heading level (min_level).
+        Step 2 — if only ONE heading exists at min_level it is a document title;
+                  the real module boundary level is min_level + 1.
+        Step 3 — collect every heading at module_level EXCEPT dotted sub-sections
+                  whose prefix contains an embedded dot (e.g. "2.1", "2.1.1",
+                  "3.4.5").  This means:
+                    ✓  "8. Material Issue With Job"   (plain integer prefix)
+                    ✓  "Step 1 – Purchase Order Creation"
+                    ✓  "Phase 2 – GRN / Material Inward"
+                    ✓  "Hardware Tab"
+                    ✗  "2.1 Material Requisition Against Secured Job"
+                    ✗  "4.15 Business Rules"
+
+    Fallback path — heading_hierarchy absent:
+        Scans raw Markdown text for lines starting with exactly one ``#``
+        followed by a plain-integer numbered title (``# 8. Material Issue``).
+        Level-2+ lines such as ``## 2.1 Purpose`` are excluded.
+
+    Returns:
+        Ordered list of heading texts that form hard module boundaries.
+        Empty list when no qualifying headings are found.
+    """
+    import re as _re
+
+    # Dotted sub-section prefix: "2.1 …", "2.1.1 …", "3.4.5 …"
+    # These are ALWAYS internal to a parent module, never a module boundary.
+    _dotted_sub_re = _re.compile(r"^\d+\.\d+")
+
+    seen:  set[str]  = set()
+    seeds: list[str] = []
+
+    if heading_hierarchy:
+        # ── Step 1: find shallowest level ────────────────────────────────────
+        all_levels = [
+            h.get("level", 99)
+            for h in heading_hierarchy
+            if (h.get("text") or "").strip()
+        ]
+        if not all_levels:
+            return []
+        min_level = min(all_levels)
+
+        # ── Step 2: single heading at min_level → it is the document title ───
+        headings_at_min = [
+            h for h in heading_hierarchy
+            if h.get("level", 99) == min_level and (h.get("text") or "").strip()
+        ]
+        module_level = (min_level + 1) if len(headings_at_min) <= 1 else min_level
+
+        # ── Step 3: collect every heading at module_level that is not a
+        #            dotted sub-section ─────────────────────────────────────────
+        for h in heading_hierarchy:
+            if h.get("level", 99) != module_level:
+                continue
+            text = (h.get("text") or "").strip()
+            if not text:
+                continue
+            if _dotted_sub_re.match(text):
+                continue   # "2.1 …", "4.15 …" — sub-section, not a module
+            if text not in seen:
+                seen.add(text)
+                seeds.append(text)
+        return seeds
+
+    # ── Fallback path: raw Markdown text scan ────────────────────────────────
+    # Require exactly one leading "#" (level-1 Markdown) so that "## 2.1 …"
+    # lines are excluded.  Only plain-integer prefixed titles qualify.
+    pattern = _re.compile(
+        r"^#\s+(\d+\.\s+[A-Z\u0080-\uFFFF][^\n]{2,80})",
+        _re.MULTILINE,
+    )
+    for m in pattern.finditer(document_text):
+        heading = m.group(1).strip()
+        # Skip dotted sub-sections that somehow end up as level-1 Markdown
+        if _dotted_sub_re.match(heading):
+            continue
+        if heading not in seen:
+            seen.add(heading)
+            seeds.append(heading)
+    return seeds
+
+
 async def segmentation_node(state: ExtractionState) -> dict[str, Any]:
     """
     Identify top-level modules from the heading hierarchy.
+
+    Before calling the LLM, Python pre-segmentation scans the raw document
+    text for top-level numbered sections (e.g. "8. Material Issue With Job").
+    These become guaranteed module boundaries injected into the prompt as
+    seed_modules — the LLM cannot merge them.
+
     Mirrors Phase 0 of the original llm_service.py.
     """
     logger.info("segmentation_node: identifying modules from heading hierarchy.")
     prompt_data = _load_prompt("segmentation")
 
+    # ── Python pre-segmentation: detect guaranteed module boundaries ──────────
+    document_text: str = state.get("document_text", "")
+    seed_headings = _extract_seed_modules(document_text, state.get("heading_hierarchy"))
+
+    if seed_headings:
+        logger.info(
+            "segmentation_node: %d seed module(s) detected by Python pre-scan: %s",
+            len(seed_headings), seed_headings,
+        )
+        seed_block = (
+            "GUARANTEED MODULE BOUNDARIES — you MUST keep each as its own module"
+            " (never merge two together):\n"
+            + "\n".join(f"  - {h}" for h in seed_headings)
+            + "\n"
+        )
+    else:
+        seed_block = ""
+
+    # ── Build and send the segmentation prompt ────────────────────────────────
     heading_hierarchy_json = json.dumps(state["heading_hierarchy"], indent=2)
     user_prompt = _fmt(
         prompt_data["user_template"],
         heading_hierarchy=heading_hierarchy_json,
+        seed_modules=seed_block,
     )
 
     result, usages = await call_llm_with_schema(
@@ -234,6 +423,43 @@ async def segmentation_node(state: ExtractionState) -> dict[str, Any]:
     )
 
     modules: list[dict[str, Any]] = result.get("modules", [])
+
+    # ── Guarantee seed modules are present in the result ─────────────────────
+    # If the LLM dropped any seed module, inject it back so slicing still works.
+    if seed_headings and modules:
+        existing_headings = {m.get("heading", "").strip() for m in modules}
+        for seed in seed_headings:
+            if seed not in existing_headings:
+                logger.warning(
+                    "segmentation_node: LLM dropped seed module '%s'; re-injecting.",
+                    seed,
+                )
+                modules.append({
+                    "name": seed.split(".", 1)[-1].strip()[:50],
+                    "heading": seed,
+                    "level": 2,
+                    "description": f"Requirements for {seed}",
+                })
+
+    # ── Post-processing: strip dotted sub-section modules ────────────────────
+    # The LLM sometimes emits modules for headings like "2.1 Material
+    # Requisition Against Secured Job" or "4.15 Business Rules".  These are
+    # always sub-sections WITHIN a parent module, never stand-alone modules.
+    # Remove any module whose heading OR name starts with a dotted-sub prefix.
+    import re as _re
+    _dotted_sub_re = _re.compile(r"^\d+\.\d+")
+    before_filter = len(modules)
+    modules = [
+        m for m in modules
+        if not _dotted_sub_re.match(m.get("heading", "") or m.get("name", "") or "")
+    ]
+    if len(modules) < before_filter:
+        logger.info(
+            "segmentation_node: removed %d dotted sub-section pseudo-module(s)"
+            " — %d real module(s) remain.",
+            before_filter - len(modules), len(modules),
+        )
+
     if not modules:
         # Fallback: treat the whole document as one module
         logger.warning("segmentation_node: no modules found; falling back to single module.")
@@ -289,144 +515,663 @@ def build_slices_node(state: ExtractionState) -> list["Send"]:  # type: ignore[n
     return sends
 
 
-# ── Phase 1: Per-module extraction + summary (parallel via Send fan-out) ───────
+# ── Chunk-and-merge helpers ───────────────────────────────────────────────────
 
-async def extract_module_node(slice_input: ModuleSlice) -> dict[str, Any]:
+def _split_module_into_chunks(
+    text: str,
+    budget_tokens: int,
+    module_name: str,
+    *,
+    min_chunk_tokens: int = 300,
+    max_chunks: int = 10,
+) -> list[str]:
     """
-    Run extraction + summary for ONE module in parallel (asyncio.gather).
-    Mirrors Phase 1 of the original llm_service.py.
+    Split *text* into N chunks each fitting within *budget_tokens*.
 
-    Invoked N times in parallel by the Send fan-out from build_slices_node.
-    Each call appends one ModuleResult to state["results"] via the reducer.
+    Splitting strategy (in order of preference):
+    1. At Markdown heading boundaries (## / ###) — semantic sections.
+    2. At numbered-section boundaries (e.g. "8.1 Sub-section", "3.2.4 Tab")
+       — the primary pattern in ERP/fenestration user story documents where
+       authors use bold-numbered paragraphs rather than Word Heading styles.
+       This ensures "8.16 Transaction History" and "8.17 Print Format" become
+       separate logical units rather than being split mid-way at blank lines.
+    3. At blank-line paragraph boundaries — if a single section still exceeds
+       the budget after the above passes.
+
+    Tiny trailing sections (< min_chunk_tokens) are merged into the previous
+    chunk to avoid single-sentence chunks that waste an LLM call.
+
+    Chunks beyond max_chunks are discarded with a WARNING — prevents a
+    pathologically large module from spawning hundreds of LLM calls.
+
+    Every returned chunk is prefixed with a context header so the LLM knows
+    it is receiving a partial view:
+        [Part 2/4 of module 'PO Creation Flow'] — extract only the
+        requirements visible in this part.
     """
-    module_name = slice_input["module_name"]
-    module_text = slice_input["module_text"]
-    mode        = slice_input["mode"]
+    import re as _re
 
-    logger.info("extract_module_node: extracting '%s' (mode=%s).", module_name, mode)
+    # Matches both Markdown headings and numbered-section lines.
+    # Numbered-section pattern: optional leading whitespace, one or more
+    # digit groups separated by dots (e.g. 8, 8.1, 3.2.4), optional trailing
+    # dot, whitespace, then an uppercase or accented letter.
+    heading_re  = _re.compile(r"^#{1,6}\s+.+$")
+    numbered_re = _re.compile(r"^\s*\d+(\.\d+)*\.?\s+[A-Z\u0080-\uFFFF]")
 
-    summary_prompt  = _load_prompt("summary_extraction")
-    base_rules_text = _load_prompt("base_rules").get("rules", "")
+    def _is_section_boundary(line: str) -> bool:
+        stripped = line.rstrip()
+        return bool(heading_re.match(stripped) or numbered_re.match(stripped))
 
-    summary_user = _fmt(
-        summary_prompt["user_template"],
-        module_name=module_name,
-        module_text=module_text,
+    # ── Group lines into boundary-delimited sections ──────────────────────────
+    lines    = text.splitlines(keepends=True)
+    sections: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        if _is_section_boundary(line) and current:
+            sec = "".join(current)
+            if sec.strip():
+                sections.append(sec)
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        sec = "".join(current)
+        if sec.strip():
+            sections.append(sec)
+
+    # Fallback: no structured boundaries found → split at blank lines
+    if len(sections) <= 1:
+        sections = [p.strip() for p in _re.split(r"\n{2,}", text) if p.strip()]
+        if not sections:
+            sections = [text]
+
+    # ── Accumulate sections into budget-sized chunks ──────────────────────────
+    chunks: list[str] = []
+    current_parts: list[str] = []
+    current_tokens = 0
+
+    for section in sections:
+        section_tokens = count_tokens(section)
+
+        # A single section exceeds the budget — split it at blank lines
+        if section_tokens > budget_tokens:
+            if current_parts:
+                chunks.append("\n\n".join(current_parts))
+                current_parts = []
+                current_tokens = 0
+            sub_parts: list[str] = []
+            sub_tokens = 0
+            for sub in [p.strip() for p in _re.split(r"\n{2,}", section) if p.strip()]:
+                st = count_tokens(sub)
+                if sub_tokens + st > budget_tokens and sub_parts:
+                    chunks.append("\n\n".join(sub_parts))
+                    sub_parts  = [sub]
+                    sub_tokens = st
+                else:
+                    sub_parts.append(sub)
+                    sub_tokens += st
+            if sub_parts:
+                chunks.append("\n\n".join(sub_parts))
+            continue
+
+        if current_tokens + section_tokens > budget_tokens and current_parts:
+            chunks.append("\n\n".join(current_parts))
+            current_parts  = [section]
+            current_tokens = section_tokens
+        else:
+            current_parts.append(section)
+            current_tokens += section_tokens
+
+    if current_parts:
+        chunks.append("\n\n".join(current_parts))
+
+    # ── Merge tiny trailing chunks (< min_chunk_tokens) into previous ─────────
+    merged: list[str] = []
+    for chunk in chunks:
+        if merged and count_tokens(chunk) < min_chunk_tokens:
+            merged[-1] = merged[-1] + "\n\n" + chunk
+        else:
+            merged.append(chunk)
+
+    # ── Cap at max_chunks ─────────────────────────────────────────────────────
+    if len(merged) > max_chunks:
+        logger.warning(
+            "_split_module_into_chunks: '%s' produced %d chunks (cap=%d); "
+            "last %d chunk(s) will not be extracted — some requirements may be incomplete.",
+            module_name, len(merged), max_chunks, len(merged) - max_chunks,
+        )
+        merged = merged[:max_chunks]
+
+    # ── Prefix every chunk with a context header ──────────────────────────────
+    total = len(merged)
+    return [
+        f"[Part {i + 1}/{total} of module '{module_name}'] "
+        f"— extract only requirements visible in this part.\n\n{chunk}"
+        for i, chunk in enumerate(merged)
+    ]
+
+
+def _merge_chunk_extractions(
+    chunk_results: list[dict[str, Any]],
+    mode: str,
+    module_name: str,
+) -> dict[str, Any]:
+    """
+    Merge N per-chunk extraction dicts into one combined result.
+
+    Dedup keys:
+      screens       → by 'name'
+      api_endpoints → by (method, path)
+      models / enums → by 'name'
+      business_rules / business_logic / workflows → concat + exact-key dedup
+    """
+    if not chunk_results:
+        return {"module": {"name": module_name}}
+    if len(chunk_results) == 1:
+        return chunk_results[0]
+
+    def _dedup_by_name(items: list[dict]) -> list[dict]:
+        seen: set[str] = set()
+        out:  list[dict] = []
+        for item in items:
+            k = item.get("name", "")
+            if k and k not in seen:
+                seen.add(k)
+                out.append(item)
+            elif not k:
+                out.append(item)
+        return out
+
+    def _dedup_endpoints(items: list[dict]) -> list[dict]:
+        seen: set[tuple] = set()
+        out:  list[dict] = []
+        for ep in items:
+            k = (ep.get("method", "").upper(), ep.get("path", ""))
+            if k not in seen:
+                seen.add(k)
+                out.append(ep)
+        return out
+
+    def _dedup_list(items: list) -> list:
+        seen: set = set()
+        out:  list = []
+        for item in items:
+            if isinstance(item, str):
+                key = item
+            elif isinstance(item, dict):
+                key = next((v for v in item.values() if isinstance(v, str)), repr(item))
+            else:
+                key = repr(item)
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+        return out
+
+    description = next(
+        (r.get("module", {}).get("description")
+         for r in chunk_results if r.get("module", {}).get("description")),
+        None,
     )
 
-    # ── "both" mode: two focused parallel calls (fe + be) instead of one
-    #    giant combined prompt that reliably times out.
     if mode == "both":
-        fe_prompt = _load_prompt("frontend_extraction")
-        be_prompt = _load_prompt("backend_extraction")
+        screens, enums, fe_rules, fe_flows         = [], [], [], []
+        endpoints, models, be_logic, be_flows      = [], [], [], []
+        for r in chunk_results:
+            m  = r.get("module", {})
+            fe = m.get("frontend", {})
+            be = m.get("backend",  {})
+            screens.extend(   fe.get("screens",        []))
+            enums.extend(     fe.get("enums",          []))
+            fe_rules.extend(  fe.get("business_rules", []))
+            fe_flows.extend(  fe.get("workflows",      []))
+            endpoints.extend( be.get("api_endpoints",  []))
+            models.extend(    be.get("models",         []))
+            be_logic.extend(  be.get("business_logic", []))
+            be_flows.extend(  be.get("workflows",      []))
+        return {
+            "module": {
+                "name":        module_name,
+                "description": description,
+                "frontend": {
+                    "screens":         _dedup_by_name(screens),
+                    "enums":           _dedup_by_name(enums),
+                    "business_rules":  _dedup_list(fe_rules),
+                    "workflows":       _dedup_list(fe_flows),
+                },
+                "backend": {
+                    "api_endpoints":   _dedup_endpoints(endpoints),
+                    "models":          _dedup_by_name(models),
+                    "business_logic":  _dedup_list(be_logic),
+                    "workflows":       _dedup_list(be_flows),
+                },
+            }
+        }
 
+    if mode == "frontend":
+        screens, enums, rules, flows = [], [], [], []
+        for r in chunk_results:
+            m = r.get("module", {})
+            screens.extend(m.get("screens",        []))
+            enums.extend(  m.get("enums",          []))
+            rules.extend(  m.get("business_rules", []))
+            flows.extend(  m.get("workflows",      []))
+        return {
+            "module": {
+                "name":           module_name,
+                "description":    description,
+                "screens":        _dedup_by_name(screens),
+                "enums":          _dedup_by_name(enums),
+                "business_rules": _dedup_list(rules),
+                "workflows":      _dedup_list(flows),
+            }
+        }
+
+    # mode == "backend"
+    endpoints, models, logic, flows = [], [], [], []
+    for r in chunk_results:
+        m = r.get("module", {})
+        endpoints.extend(m.get("api_endpoints",  []))
+        models.extend(   m.get("models",         []))
+        logic.extend(    m.get("business_logic", []))
+        flows.extend(    m.get("workflows",      []))
+    return {
+        "module": {
+            "name":           module_name,
+            "description":    description,
+            "api_endpoints":  _dedup_endpoints(endpoints),
+            "models":         _dedup_by_name(models),
+            "business_logic": _dedup_list(logic),
+            "workflows":      _dedup_list(flows),
+        }
+    }
+
+
+async def _extract_chunk_for_mode(
+    chunk_text: str,
+    module_name: str,
+    mode: str,
+    fe_prompt: dict[str, str] | None,
+    be_prompt: dict[str, str] | None,
+    extraction_prompt: dict[str, str] | None,
+    extraction_schema: dict[str, Any] | None,
+    base_rules_text: str,
+    chunk_label: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """
+    Run extraction LLM call(s) for a single chunk of module text.
+
+    mode='both'            → fires fe + be calls in parallel (asyncio.gather).
+    mode='frontend'/'backend' → single LLM call.
+
+    Returns (extraction_result_dict, usages_list).
+    Summary is NOT run here — the caller handles it on the first chunk only.
+    """
+    if mode == "both":
         fe_user = _fmt(
             fe_prompt["user_template"],
             module_name=module_name,
-            module_text=module_text,
+            module_text=chunk_text,
             base_rules=base_rules_text,
         )
         be_user = _fmt(
             be_prompt["user_template"],
             module_name=module_name,
-            module_text=module_text,
+            module_text=chunk_text,
             base_rules=base_rules_text,
         )
-
-        (fe_result, fe_usages), (be_result, be_usages), (summary_result, summary_usages) = (
-            await asyncio.gather(
-                call_llm_with_schema(
-                    system_prompt=fe_prompt["system"],
-                    user_prompt=fe_user,
-                    schema=FRONTEND_SCHEMA,
-                    schema_name=f"extraction:fe:{module_name}",
-                    normalizer=_normalize_extraction,
-                ),
-                call_llm_with_schema(
-                    system_prompt=be_prompt["system"],
-                    user_prompt=be_user,
-                    schema=BACKEND_SCHEMA,
-                    schema_name=f"extraction:be:{module_name}",
-                ),
-                call_llm_with_schema(
-                    system_prompt=summary_prompt["system"],
-                    user_prompt=summary_user,
-                    schema=SUMMARY_SCHEMA,
-                    schema_name=f"summary:{module_name}",
-                ),
-            )
+        (fe_result, fe_usages), (be_result, be_usages) = await asyncio.gather(
+            call_llm_with_schema(
+                system_prompt=fe_prompt["system"],
+                user_prompt=fe_user,
+                schema=FRONTEND_SCHEMA,
+                schema_name=f"extraction:fe:{module_name}:{chunk_label}",
+                normalizer=_normalize_extraction,
+            ),
+            call_llm_with_schema(
+                system_prompt=be_prompt["system"],
+                user_prompt=be_user,
+                schema=BACKEND_SCHEMA,
+                schema_name=f"extraction:be:{module_name}:{chunk_label}",
+            ),
         )
-
         fe_module = fe_result.get("module", {})
         be_module = be_result.get("module", {})
-
-        # Merge into combined schema shape: {"module": {"frontend": ..., "backend": ...}}
         extraction_result: dict[str, Any] = {
             "module": {
                 "name":        module_name,
                 "description": be_module.get("description") or fe_module.get("description"),
                 "frontend": {
-                    "screens":         fe_module.get("screens", []),
-                    "enums":           fe_module.get("enums", []),
-                    "business_rules":  fe_module.get("business_rules", []),
-                    "workflows":       fe_module.get("workflows", []),
+                    "screens":        fe_module.get("screens",        []),
+                    "enums":          fe_module.get("enums",          []),
+                    "business_rules": fe_module.get("business_rules", []),
+                    "workflows":      fe_module.get("workflows",      []),
                 },
                 "backend": {
-                    "api_endpoints":   be_module.get("api_endpoints", []),
-                    "models":          be_module.get("models", []),
-                    "business_logic":  be_module.get("business_logic", []),
-                    "workflows":       be_module.get("workflows", []),
+                    "api_endpoints":  be_module.get("api_endpoints",  []),
+                    "models":         be_module.get("models",         []),
+                    "business_logic": be_module.get("business_logic", []),
+                    "workflows":      be_module.get("workflows",      []),
                 },
             }
         }
-        extraction_usages = fe_usages + be_usages
+        return extraction_result, fe_usages + be_usages
 
-        # Cross-validate frontend screen references
-        _cross_validate_module(extraction_result, mode)
+    # mode == "frontend" or "backend"
+    extraction_normalizer = _normalize_extraction if mode == "frontend" else None
+    extraction_user = _fmt(
+        extraction_prompt["user_template"],
+        module_name=module_name,
+        module_text=chunk_text,
+        base_rules=base_rules_text,
+    )
+    extraction_result, extraction_usages = await call_llm_with_schema(
+        system_prompt=extraction_prompt["system"],
+        user_prompt=extraction_user,
+        schema=extraction_schema,
+        schema_name=f"extraction:{mode}:{module_name}:{chunk_label}",
+        normalizer=extraction_normalizer,
+    )
+    if extraction_result.get("module", {}).get("name", "") == "":
+        extraction_result.setdefault("module", {})["name"] = module_name
+    return extraction_result, extraction_usages
 
+
+# ── Module concurrency semaphore (Phase 5) ────────────────────────────────────
+# The LangGraph Send fan-out fires all N extract_module_node coroutines at once.
+# Capping concurrent executions at MODULE_BATCH_SIZE (default 3) prevents the
+# rate-limit cascade that causes MODULE_EXTRACTION_TIMEOUT on large documents.
+
+_MODULE_SEMAPHORE: asyncio.Semaphore | None = None
+
+
+def _get_module_semaphore() -> asyncio.Semaphore:
+    """
+    Return (lazily creating) the module-level concurrency semaphore.
+
+    Always called from within a running event loop (inside a coroutine),
+    so asyncio.Semaphore() is always bound to the correct loop.
+    """
+    global _MODULE_SEMAPHORE
+    if _MODULE_SEMAPHORE is None:
+        _MODULE_SEMAPHORE = asyncio.Semaphore(MODULE_BATCH_SIZE)
+    return _MODULE_SEMAPHORE
+
+
+# ── Phase 1: Per-module extraction + summary (parallel via Send fan-out) ───────
+
+async def _extract_module_body(slice_input: ModuleSlice) -> dict[str, Any]:
+    """
+    Core extraction logic for ONE module: chunking → LLM extraction → merge → summary.
+
+    In mode='both': Phase A runs all FE extractions + summary in parallel (N+1
+    concurrent), then Phase B runs all BE extractions in parallel (N concurrent).
+    This halves peak concurrency vs the old approach of running FE+BE together
+    for every chunk simultaneously (previously 2N+1 concurrent).
+
+    In mode='frontend' or 'backend': all chunks run in one parallel gather (N+1
+    concurrent) — same as before.
+
+    Called exclusively through extract_module_node which applies the module-level
+    concurrency semaphore (MODULE_BATCH_SIZE) before delegating here.
+    """
+    module_name = slice_input["module_name"]
+    module_text = slice_input["module_text"]
+    mode        = slice_input["mode"]
+
+    summary_prompt  = _load_prompt("summary_extraction")
+    base_rules_text = _load_prompt("base_rules").get("rules", "")
+
+    # ── Load extraction prompt(s) and compute real token overhead ─────────────
+    # Render templates with empty module_text so base_rules, module_name, and
+    # all fixed boilerplate are counted accurately — excluding only the content.
+    if mode == "both":
+        fe_prompt         = _load_prompt("frontend_extraction")
+        be_prompt         = _load_prompt("backend_extraction")
+        extraction_prompt = None
+        extraction_schema = None
+        fe_overhead = (
+            count_tokens(fe_prompt["system"])
+            + count_tokens(_fmt(fe_prompt["user_template"], module_name=module_name, module_text="", base_rules=base_rules_text))
+        )
+        be_overhead = (
+            count_tokens(be_prompt["system"])
+            + count_tokens(_fmt(be_prompt["user_template"], module_name=module_name, module_text="", base_rules=base_rules_text))
+        )
+        actual_overhead = max(fe_overhead, be_overhead)
     else:
-        # ── Single-call path for frontend / backend ───────────────────────
+        fe_prompt = None
+        be_prompt = None
         mode_map = {
             "frontend": ("frontend_extraction", FRONTEND_SCHEMA),
             "backend":  ("backend_extraction",  BACKEND_SCHEMA),
         }
         prompt_name, extraction_schema = mode_map[mode]
         extraction_prompt = _load_prompt(prompt_name)
-
-        extraction_user = _fmt(
-            extraction_prompt["user_template"],
-            module_name=module_name,
-            module_text=module_text,
-            base_rules=base_rules_text,
+        actual_overhead = (
+            count_tokens(extraction_prompt["system"])
+            + count_tokens(_fmt(extraction_prompt["user_template"], module_name=module_name, module_text="", base_rules=base_rules_text))
         )
 
-        extraction_normalizer = _normalize_extraction if mode == "frontend" else None
+    token_budget       = max(TOTAL_INPUT_TOKEN_LIMIT - actual_overhead, 1000)
+    module_token_count = count_tokens(module_text)
 
-        (extraction_result, extraction_usages), (summary_result, summary_usages) = (
-            await asyncio.gather(
-                call_llm_with_schema(
-                    system_prompt=extraction_prompt["system"],
-                    user_prompt=extraction_user,
-                    schema=extraction_schema,
-                    schema_name=f"extraction:{module_name}",
-                    normalizer=extraction_normalizer,
-                ),
-                call_llm_with_schema(
-                    system_prompt=summary_prompt["system"],
-                    user_prompt=summary_user,
-                    schema=SUMMARY_SCHEMA,
-                    schema_name=f"summary:{module_name}",
-                ),
+    # ── Single-pass (fits) vs chunk-and-merge (too large) ────────────────────
+    if module_token_count <= token_budget:
+        chunks = [module_text]
+    else:
+        chunks = _split_module_into_chunks(module_text, token_budget, module_name)
+        logger.info(
+            "extract_module_node: '%s' too large for single pass "
+            "(%d tokens > budget %d) — splitting into %d chunk(s) for full coverage.",
+            module_name, module_token_count, token_budget, len(chunks),
+        )
+
+    logger.info(
+        "extract_module_node: extracting '%s' (mode=%s, chunks=%d, timeout=%ds).",
+        module_name, mode, len(chunks), MODULE_EXTRACTION_TIMEOUT,
+    )
+
+    # ── Build summary coroutine ───────────────────────────────────────────────
+    # Runs on the first chunk only — contains the module overview; no base_rules.
+    summary_user = _fmt(
+        summary_prompt["user_template"],
+        module_name=module_name,
+        module_text=chunks[0],
+    )
+    summary_coro = call_llm_with_schema(
+        system_prompt=summary_prompt["system"],
+        user_prompt=summary_user,
+        schema=SUMMARY_SCHEMA,
+        schema_name=f"summary:{module_name}",
+    )
+
+    total_chunks = len(chunks)
+
+    # ── Run extraction under module timeout (Phase 4: sequential FE/BE for "both") ──
+    # mode="both"  → Phase A (all FE + summary in parallel, N+1 concurrent)
+    #                → Phase B (all BE in parallel, N concurrent)
+    #                Peak drops from 2N+1 → N+1, halving rate-limit pressure.
+    # mode="frontend"/"backend" → single parallel gather, unchanged (1 call/chunk).
+    chunk_pairs:    list[tuple[dict[str, Any], list[dict[str, Any]]]] = []
+    summary_result: dict[str, Any]       = {}
+    summary_usages: list[dict[str, Any]] = []
+
+    try:
+        if mode == "both":
+            _phase_start = time.monotonic()
+
+            # Phase A — all FE extractions + summary in parallel (N+1 concurrent)
+            fe_coros = [
+                _extract_chunk_for_mode(
+                    chunk_text=chunk,
+                    module_name=module_name,
+                    mode="frontend",
+                    fe_prompt=None,
+                    be_prompt=None,
+                    extraction_prompt=fe_prompt,
+                    extraction_schema=FRONTEND_SCHEMA,
+                    base_rules_text=base_rules_text,
+                    chunk_label=f"fe-p{i + 1}of{total_chunks}",
+                )
+                for i, chunk in enumerate(chunks)
+            ]
+            phase_a = await asyncio.wait_for(
+                asyncio.gather(summary_coro, *fe_coros),
+                timeout=MODULE_EXTRACTION_TIMEOUT,
             )
+            (summary_result, summary_usages), *fe_pairs = phase_a
+
+            # Phase B — all BE extractions in parallel (N concurrent)
+            _be_timeout = max(MODULE_EXTRACTION_TIMEOUT - (time.monotonic() - _phase_start), 60.0)
+            be_coros = [
+                _extract_chunk_for_mode(
+                    chunk_text=chunk,
+                    module_name=module_name,
+                    mode="backend",
+                    fe_prompt=None,
+                    be_prompt=None,
+                    extraction_prompt=be_prompt,
+                    extraction_schema=BACKEND_SCHEMA,
+                    base_rules_text=base_rules_text,
+                    chunk_label=f"be-p{i + 1}of{total_chunks}",
+                )
+                for i, chunk in enumerate(chunks)
+            ]
+            be_pairs = list(await asyncio.wait_for(
+                asyncio.gather(*be_coros),
+                timeout=_be_timeout,
+            ))
+
+            # Stitch FE + BE per chunk into the unified "both" structure
+            for (fe_result, fe_usages), (be_result, be_usages) in zip(fe_pairs, be_pairs):
+                fe_mod = fe_result.get("module", {})
+                be_mod = be_result.get("module", {})
+                combined: dict[str, Any] = {
+                    "module": {
+                        "name":        module_name,
+                        "description": be_mod.get("description") or fe_mod.get("description"),
+                        "frontend": {
+                            "screens":        fe_mod.get("screens",        []),
+                            "enums":          fe_mod.get("enums",          []),
+                            "business_rules": fe_mod.get("business_rules", []),
+                            "workflows":      fe_mod.get("workflows",      []),
+                        },
+                        "backend": {
+                            "api_endpoints":  be_mod.get("api_endpoints",  []),
+                            "models":         be_mod.get("models",         []),
+                            "business_logic": be_mod.get("business_logic", []),
+                            "workflows":      be_mod.get("workflows",      []),
+                        },
+                    }
+                }
+                chunk_pairs.append((combined, fe_usages + be_usages))
+
+        else:
+            # Single-mode (frontend or backend): all chunks + summary in parallel
+            extraction_coros = [
+                _extract_chunk_for_mode(
+                    chunk_text=chunk,
+                    module_name=module_name,
+                    mode=mode,
+                    fe_prompt=fe_prompt,
+                    be_prompt=be_prompt,
+                    extraction_prompt=extraction_prompt,
+                    extraction_schema=extraction_schema,
+                    base_rules_text=base_rules_text,
+                    chunk_label=f"p{i + 1}of{total_chunks}",
+                )
+                for i, chunk in enumerate(chunks)
+            ]
+            all_results = await asyncio.wait_for(
+                asyncio.gather(*extraction_coros, summary_coro),
+                timeout=MODULE_EXTRACTION_TIMEOUT,
+            )
+            *raw_pairs, (summary_result, summary_usages) = all_results
+            chunk_pairs = list(raw_pairs)
+
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            f"Module '{module_name}' exceeded the {MODULE_EXTRACTION_TIMEOUT}s deadline "
+            f"(mode={mode}, chunks={total_chunks}). The LLM calls did not complete in time — "
+            f"consider raising MODULE_EXTRACTION_TIMEOUT or LLM_TIMEOUT."
         )
 
-        # Ensure module name is set even if LLM left it blank
-        if extraction_result.get("module", {}).get("name", "") == "":
-            extraction_result.setdefault("module", {})["name"] = module_name
+    chunk_extraction_results                    = [pair[0] for pair in chunk_pairs]
+    extraction_usages: list[dict[str, Any]]     = [u for pair in chunk_pairs for u in pair[1]]
 
-        if mode == "frontend":
-            _cross_validate_module(extraction_result, mode)
+    # ── Merge chunk extractions ───────────────────────────────────────────────
+    if len(chunk_extraction_results) == 1:
+        extraction_result = chunk_extraction_results[0]
+    else:
+        extraction_result = _merge_chunk_extractions(chunk_extraction_results, mode, module_name)
+        logger.info(
+            "extract_module_node: '%s' merged %d chunk(s) into final extraction.",
+            module_name, len(chunk_extraction_results),
+        )
 
+    # ── Cross-validate screen references ─────────────────────────────────────
+    if mode in ("both", "frontend"):
+        _cross_validate_module(extraction_result, mode)
+
+    # ── Ensure module name is set (single-mode edge case) ────────────────────
+    if mode != "both" and extraction_result.get("module", {}).get("name", "") == "":
+        extraction_result.setdefault("module", {})["name"] = module_name
+
+    # ── BE api_endpoints retry guard (Phase 7) ────────────────────────────────
+    # If the LLM produced models but 0 endpoints the output was silently
+    # truncated. Fire one targeted retry with an explicit mandate.
+    if mode in ("both", "backend"):
+        _be_prompt_ref = be_prompt if mode == "both" else extraction_prompt
+        if _be_prompt_ref is not None:
+            _be_mod = (extraction_result.get("module") or {})
+            if mode == "both":
+                _be_mod = _be_mod.get("backend", {})
+            _has_endpoints = bool(_be_mod.get("api_endpoints"))
+            _has_models    = bool(_be_mod.get("models"))
+            if not _has_endpoints and _has_models:
+                logger.warning(
+                    "_extract_module_body: '%s' has %d model(s) but 0 api_endpoints — "
+                    "firing targeted BE retry.",
+                    module_name, len(_be_mod.get("models", [])),
+                )
+                _retry_user = (
+                    _fmt(
+                        _be_prompt_ref["user_template"],
+                        module_name=module_name,
+                        module_text=chunks[0],   # always fits budget by construction
+                        base_rules=base_rules_text,
+                    )
+                    + "\n\n\u26a0\ufe0f IMPORTANT: Your previous response contained 0 api_endpoints."
+                      " This is always wrong. You MUST derive API endpoints from the user"
+                      " actions described in the text (view, create, edit, delete, approve,"
+                      " scan, upload, export \u2026). Return the full JSON with a non-empty"
+                      " api_endpoints array."
+                )
+                try:
+                    _retry_result, _retry_usages = await call_llm_with_schema(
+                        system_prompt=_be_prompt_ref["system"],
+                        user_prompt=_retry_user,
+                        schema=BACKEND_SCHEMA,
+                        schema_name=f"extraction:be_retry:{module_name}",
+                    )
+                    _retry_endpoints = _retry_result.get("module", {}).get("api_endpoints", [])
+                    if _retry_endpoints:
+                        if mode == "both":
+                            extraction_result["module"]["backend"]["api_endpoints"] = _retry_endpoints
+                        else:
+                            extraction_result["module"]["api_endpoints"] = _retry_endpoints
+                        extraction_usages.extend(_retry_usages)
+                        logger.info(
+                            "_extract_module_body: '%s' BE retry recovered %d endpoint(s).",
+                            module_name, len(_retry_endpoints),
+                        )
+                except Exception as _retry_exc:
+                    logger.warning(
+                        "_extract_module_body: '%s' BE retry failed: %s",
+                        module_name, _retry_exc,
+                    )
+
+    # ── Logging ───────────────────────────────────────────────────────────────
     all_usages = extraction_usages + summary_usages
     if mode == "backend":
         logger.info(
@@ -460,6 +1205,20 @@ async def extract_module_node(slice_input: ModuleSlice) -> dict[str, Any]:
     }
     # Append to the state's results list via the Annotated reducer
     return {"results": [module_result]}
+
+
+async def extract_module_node(slice_input: ModuleSlice) -> dict[str, Any]:
+    """
+    Public LangGraph node — throttles concurrent module extractions with a
+    semaphore (MODULE_BATCH_SIZE, default 3) before delegating to
+    _extract_module_body.
+
+    Prevents the Send fan-out from firing all N modules simultaneously on
+    large documents, which causes rate-limit cascades and timeout failures
+    (the root cause of Stock Module 2/3 and PO Module empty responses).
+    """
+    async with _get_module_semaphore():
+        return await _extract_module_body(slice_input)
 
 
 def _cross_validate_module(result: dict[str, Any], mode: str) -> None:

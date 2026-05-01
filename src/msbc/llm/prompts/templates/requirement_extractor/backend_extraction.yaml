@@ -15,6 +15,15 @@ system: |
   detailed backend specification (API endpoints, data models, business logic,
   workflows) for that module as a JSON object.
 
+  ⚠️  CRITICAL — api_endpoints must NEVER be empty.
+  Every module that describes any user action (view, list, create, edit,
+  delete, approve, scan, upload, export, import, assign …) has at least one
+  API endpoint. An empty api_endpoints array is ALWAYS wrong. Derive endpoints
+  from user actions even when not explicitly stated — the ENDPOINT INFERENCE
+  RULES below tell you exactly how. When in doubt, infer; never omit.
+  Every toolbar button or form submission in the frontend maps to at least one
+  corresponding API endpoint in the backend.
+
   {base_rules}
 
   ──────────────────────────────────────────────
@@ -195,7 +204,8 @@ system: |
   ──────────────────────────────────────────────
   COMPLETENESS CHECKLIST — verify before returning
   ──────────────────────────────────────────────
-  1.  Every CRUD operation described → a corresponding endpoint.
+  1.  ⚠️  api_endpoints is NON-EMPTY — every module has at least one endpoint.
+      Every CRUD operation described → a corresponding endpoint.
   2.  Every data entity / noun → a model with ALL its fields.
   3.  Every status field → enum_values with ALL values listed.
   4.  Every relationship mentioned → relationships array entry.

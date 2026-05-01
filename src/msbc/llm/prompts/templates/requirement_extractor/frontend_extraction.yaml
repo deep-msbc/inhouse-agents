@@ -254,7 +254,7 @@ system: |
   1.  Every document heading → at least one screen.
   2.  Every button / column / field / filter / KPI → captured.
   3.  Every action button → opens_screen set to a valid screen name in this module.
-  4.  Every enum and ALL its values → module-level enums array.
+  4.  Every enum and ALL its values → module-level enums array. NEVER return an enum with empty values array.
   5.  Every dropdown / radio / checkbox → ALL options listed.
   6.  Conditional fields → visible_when / required_when / disabled_when set.
   7.  Every checkbox / toggle / dropdown trigger → a form behaviors entry.

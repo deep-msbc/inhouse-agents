@@ -57,6 +57,9 @@ SUMMARY_SCHEMA: dict = {
                         "depended_on_by":  {"type": "array", "items": _DEPENDENCY_ITEM},
                         # Some LLM responses nest shared_enums here; accept it.
                         "shared_enums":    {"type": "array", "items": _SHARED_ENUM_ITEM},
+                        # LLM sometimes places this inside dependencies instead
+                        # of at module_summary level — accept in both positions.
+                        "cross_module_validations": {"type": "array", "items": {"type": "string"}},
                     },
                 },
                 "shared_enums": {"type": "array", "items": _SHARED_ENUM_ITEM},

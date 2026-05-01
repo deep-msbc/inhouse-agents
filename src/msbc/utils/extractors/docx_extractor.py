@@ -74,11 +74,26 @@ def extract_text(file_bytes: bytes) -> str:
 
 def extract_heading_hierarchy(file_bytes: bytes) -> list[dict]:
     """
-    Extract document headings using python-docx paragraph styles.
+    Extract document headings using a dual-layer approach.
 
-    Uses the authoritative python-docx style names, so no regex heuristics
-    are needed for well-formed DOCX files. Falls back to heuristic extraction
-    only when the document has no Heading-style paragraphs at all.
+    Layer 1 (style-based):
+        Paragraphs with Word paragraph styles "Title" or "Heading 1–6".
+        Most reliable when the author applied proper styles.
+
+    Layer 2 (format-based):
+        Paragraphs detected as headings purely from visual formatting:
+          a. XML outline level (w:outlineLvl) — set by Word's outline tool
+             even when a custom/unnamed style is used.
+          b. All-bold runs + numbered section pattern (e.g. "8. Material Issue",
+             "3.2.4 Hardware Tab") — the most common pattern in ERP user stories
+             where authors type bold numbered headings without applying styles.
+          c. Large font (≥ 14 pt) + all-bold + short text — catch visually
+             prominent section titles that don't fit the numbered pattern.
+
+    Both layers always run. Results are merged in document order and
+    deduplicated by text (style-detected level wins when both catch the
+    same paragraph). Falls back to heuristic extraction from plain text
+    only when both layers return nothing.
 
     Returns:
         Ordered list of {"level": int, "text": str} dicts.
@@ -88,9 +103,12 @@ def extract_heading_hierarchy(file_bytes: bytes) -> list[dict]:
         RuntimeError: If python-docx is not installed.
     """
     doc = _open_docx(file_bytes)
-    headings: list[dict] = []
 
-    for para in doc.paragraphs:
+    style_entries:  list[tuple[int, dict]] = []   # (para_idx, heading_dict)
+    format_entries: list[tuple[int, dict]] = []
+    style_texts:    dict[str, int]         = {}   # text → level (for dedup)
+
+    for para_idx, para in enumerate(doc.paragraphs):
         text = para.text.strip()
         if not text:
             continue
@@ -98,17 +116,48 @@ def extract_heading_hierarchy(file_bytes: bytes) -> list[dict]:
         style_name  = (para.style.name or "") if para.style else ""
         lower_style = style_name.lower()
 
+        # ── Layer 1: Style-based ──────────────────────────────────────────────
         if lower_style == "title":
-            headings.append({"level": 0, "text": text})
-        elif "heading" in lower_style:
-            headings.append({"level": _heading_level(style_name), "text": text})
+            entry = {"level": 0, "text": text}
+            style_entries.append((para_idx, entry))
+            style_texts[text] = 0
+            continue
+
+        if "heading" in lower_style:
+            level = _heading_level(style_name)
+            entry = {"level": level, "text": text}
+            style_entries.append((para_idx, entry))
+            style_texts[text] = level
+            continue
+
+        # ── Layer 2: Format-based (only for paragraphs not caught by Layer 1) ─
+        if text in style_texts:
+            continue
+
+        detected_level = _detect_format_heading_level(para, text)
+        if detected_level is not None:
+            format_entries.append((para_idx, {"level": detected_level, "text": text}))
+
+    # ── Merge in document order ───────────────────────────────────────────────
+    all_entries = style_entries + format_entries
+    all_entries.sort(key=lambda x: x[0])
+    headings = [entry for _, entry in all_entries]
 
     if not headings:
         logger.warning(
-            "extract_heading_hierarchy: no Heading-style paragraphs found. "
-            "Falling back to heuristic extraction from extracted text."
+            "extract_heading_hierarchy: no headings found via style or format "
+            "detection. Falling back to heuristic extraction from extracted text."
         )
         return _heuristic_headings(extract_text(file_bytes))
+
+    style_count  = len(style_entries)
+    format_count = len(format_entries)
+    if format_count:
+        logger.info(
+            "extract_heading_hierarchy: %d style-based + %d format-based headings"
+            " (%d total).",
+            style_count, format_count, len(headings),
+        )
 
     return headings
 
@@ -186,6 +235,95 @@ def _clean_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
+
+
+def _detect_format_heading_level(para, text: str) -> int | None:
+    """
+    Infer heading level from paragraph formatting (no reliance on style names).
+
+    Checks (in priority order):
+    1. XML outline level (w:outlineLvl) — authoritative even with custom styles.
+    2. Numbered section pattern + all-bold runs — e.g. "8. Material Issue".
+    3. Large font (≥ 14 pt) + all-bold + short text — visual prominence cue.
+
+    Returns a level in [1, 6] or None if the paragraph is not a heading.
+    """
+    # 1. Outline level
+    outline_level = _para_outline_level(para)
+    if outline_level is not None:
+        # OOXML: 0 → Heading 1, 1 → Heading 2, … 5 → Heading 6
+        return min(outline_level + 1, 6)
+
+    # 2. Numbered section + bold
+    numbered_level = _numbered_section_level(text)
+    if numbered_level is not None and _is_bold_paragraph(para):
+        return numbered_level
+
+    # 3. Large font + bold + short
+    font_pt = _para_font_size_pt(para)
+    if (
+        font_pt is not None
+        and font_pt >= 14
+        and _is_bold_paragraph(para)
+        and len(text.split()) <= 12
+        and len(text) <= 100
+    ):
+        return 2  # treat as top-level heading
+
+    return None
+
+
+def _para_outline_level(para) -> int | None:
+    """Return the OOXML w:outlineLvl value (0–8) or None if not set."""
+    try:
+        pPr = para._element.pPr
+        if pPr is None:
+            return None
+        ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        outlineLvl = pPr.find(f"{{{ns}}}outlineLvl")
+        if outlineLvl is None:
+            return None
+        val = outlineLvl.get(f"{{{ns}}}val")
+        if val is None:
+            return None
+        level = int(val)
+        return level if level <= 8 else None
+    except Exception:
+        return None
+
+
+def _is_bold_paragraph(para) -> bool:
+    """Return True if all non-empty runs in the paragraph are bold."""
+    runs = [r for r in para.runs if r.text.strip()]
+    return bool(runs) and all(r.bold for r in runs)
+
+
+def _para_font_size_pt(para) -> float | None:
+    """Return font size in points from the paragraph's first non-empty run."""
+    for run in para.runs:
+        if run.text.strip() and run.font.size:
+            try:
+                return run.font.size.pt
+            except Exception:
+                pass
+    return None
+
+
+def _numbered_section_level(text: str) -> int | None:
+    """
+    Detect a numbered-section heading and return its depth level.
+
+    Examples:
+        "8. Material Issue With Job"    → 2  (1 numeric part → level 2)
+        "8.1 Sub-section"               → 3  (2 parts → level 3)
+        "3.2.4 Hardware Tab"            → 5  (4 parts → level 5)
+    Returns None if *text* does not match the numbered-section pattern.
+    """
+    m = re.match(r"^(\d+(?:\.\d+)*)\.?\s+\S", text)
+    if not m:
+        return None
+    depth = len(m.group(1).split("."))
+    return min(depth + 1, 6)
 
 
 def _heuristic_headings(text: str) -> list[dict]:

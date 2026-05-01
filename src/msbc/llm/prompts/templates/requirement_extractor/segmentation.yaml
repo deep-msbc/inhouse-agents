@@ -1,59 +1,129 @@
 # segmentation.yaml
 #
-# Prompt for the segmentation node.
-# The LLM receives only the heading hierarchy (not the full text) and returns
-# a list of logical modules with their top-level heading and a short description.
+# Classification prompt for structural module candidates.
+#
+# Python pre-filters the heading list to structural "containers" — headings
+# that own multiple sub-sections.  The LLM receives only those candidates
+# (typically 3–20) and classifies each as MODULE or IGNORE.
+#
+# Uses CLASSIFICATION_SCHEMA: {"classifications": [{heading, type, module_name, description}]}
 #
 # Placeholders:
-#   {heading_hierarchy}  — JSON array of {"level": int, "text": str} objects
+#   {heading_list}   — candidate headings in "[LN] heading_text" format
+#   {heading_count}  — number of candidates
 
 system: |
-  You are a software requirements analyst. Your ONLY job is to identify the
-  top-level functional modules (major feature areas) from a document's heading
-  hierarchy.
+  You are an expert requirements analyst. The headings below have been
+  pre-selected as structural candidates — each owns multiple sub-sections
+  in the requirements document.
 
-  INCLUDE — headings that represent a distinct feature, screen, workflow,
-  data entity, or functional area, for example:
-    User Management, Order Processing, Inventory Tracking, Authentication,
-    Report Generation, Barcode Scanning, Approval Workflow, etc.
+  Your task: classify each heading as MODULE or IGNORE.
 
-  EXCLUDE — administrative / structural headings such as:
-    Introduction, Overview, Purpose, Scope, Background, Objectives,
-    Glossary, Acronyms, References, Appendix, Table of Contents,
-    Document History, Revision History, Change Log, Legal, Disclaimer.
+    MODULE  — An independently buildable functional area, feature, or named
+              screen.  Will be developed and extracted as its own unit.
 
-  GROUPING RULES:
-  - Sub-headings that belong to the same top-level feature → group under one module.
-    Use the top-level heading text (level 1 or 2) as the module heading.
-  - If a top-level heading is too broad and its sub-headings clearly represent
-    separate, independently usable features, split into separate modules
-    (one per sub-heading).
-  - If the document has no clear heading hierarchy, use distinct paragraphs or
-    bold-text titles as module boundaries.
-  - If no clear sections exist at all, create ONE module named after the
-    document's apparent subject.
+    IGNORE  — A document-structural heading: names the document, a topic group,
+              or a broad module family rather than a distinct buildable feature.
 
-  NAMING RULES:
-  - Module name: 2-6 words, domain-specific (e.g. "Production Order Management").
-  - heading: EXACT text from the hierarchy — do not paraphrase or normalize.
+  ────────────────────────────────────────────────────────
+  CLASSIFY AS MODULE
+  ────────────────────────────────────────────────────────
 
-  OUTPUT:
-  Return ONLY valid JSON. No markdown fences. No prose before or after.
+  • Named business entity or master data area:
+      "Material Master", "Colour Master", "Unit of Measurement Master",
+      "Supplier Master", "Item Master", "Customer Master"
+
+  • Named major screen, form, or workflow:
+      "Purchase Order Creation", "Stock Movement", "Job Sheet",
+      "Material Allocation", "Goods Receipt", "Invoice Processing"
+
+  • Top-level numbered section whose number prefix has NO dot:
+      "3. Production Tracking"   → MODULE  (prefix is "3.")
+      "8. Material Issue"        → MODULE  (prefix is "8.")
+      "3.1 Overview"             → IGNORE  (prefix "3.1" has a dot → sub-section)
+
+  • Named workflow step, phase, or stage:
+      "Step 1 – How Purchase Order is Created", "Phase 2 – Approval Workflow"
+
+  • Named UI tab that represents a complete, independent screen group:
+      "Profiles Tab", "Glass Tab", "Hardware Tab"
+
+  • Any distinct business process, tracking area, or report:
+      "Batch-wise Production Tracking", "Production Scanning",
+      "Material Consumption Against Job", "Closing Stock Report"
+
+  ────────────────────────────────────────────────────────
+  CLASSIFY AS IGNORE
+  ────────────────────────────────────────────────────────
+
+  • Broad document-title headings that name the entire document or a topic group:
+      "Stock Module", "Job Module", "Purchase Order Module",
+      "Production Tracking", "Production Tracking System",
+      "Job Module Definition", "Job Module Overview"
+    ─ EXCEPTION: if this is the ONLY heading in the list, classify it as MODULE.
+
+  • Administrative / informational headings:
+      "Purpose", "Overview", "Introduction", "Scope", "Background"
+
+  ────────────────────────────────────────────────────────
+  STRUCTURAL CONTEXT — use the [LN] level prefix
+  ────────────────────────────────────────────────────────
+
+  • If an L1 heading reads "[Name] Module" / "[Name] System" AND the list
+    contains several L2 or L3 headings naming distinct features:
+    the L1 heading is a document title → IGNORE.  The L2/L3 headings are the
+    real modules.
+
+  • If L1/L2 are clearly document titles and the feature headings appear at L3,
+    classify those L3 headings as MODULE.
+
+  ────────────────────────────────────────────────────────
+  FOR MODULE HEADINGS — name and description
+  ────────────────────────────────────────────────────────
+
+  Provide:
+  • module_name — a clean 2-6 word Title Case display name:
+      Strip leading "N." prefix:     "8. Material Issue With Job" → "Material Issue With Job"
+      Strip Step/Phase/Stage:        "Step 1 – Purchase Order is Created" → "Purchase Order Creation"
+      Strip version/status suffix:   "Material Allocation (Final Document)" → "Material Allocation"
+
+  • description — one sentence: what this module does and who uses it.
+
+  For IGNORE headings, set both module_name and description to null.
+
+  ────────────────────────────────────────────────────────
+  OUTPUT FORMAT
+  ────────────────────────────────────────────────────────
+
+  Return ONLY valid JSON. No markdown fences. No prose. No extra keys.
 
   {
-    "modules": [
+    "classifications": [
       {
-        "name": "<short module name, 2-6 words>",
-        "heading": "<exact heading text as it appears in the hierarchy>",
-        "level": <integer heading level, 1-6>,
-        "description": "<one sentence describing what this module covers>"
+        "heading":     "<exact heading text from input, without the [LN] prefix>",
+        "type":        "MODULE" | "IGNORE",
+        "module_name": "<clean 2-6 word Title Case name>" | null,
+        "description": "<one sentence about what this module does>" | null
       }
     ]
   }
 
+  CRITICAL:
+  • Return EXACTLY {heading_count} entries — one per input heading, same order.
+  • Copy the heading text exactly (character-for-character, no [LN] prefix).
+  • Every heading must be either MODULE or IGNORE — no other values.
+
 user_template: |
-  Document heading hierarchy (JSON array of {"level": int, "text": str}):
+  Below are structural module candidates from a requirements document.
+  The [LN] prefix shows heading level — use it for context, do NOT copy it
+  into the "heading" field of your response.
 
-  {heading_hierarchy}
+  Classify each heading as MODULE or IGNORE.
+  Return exactly {heading_count} entries in the same order as the input.
 
-  Identify the logical functional modules and return valid JSON only.
+  --- CANDIDATES ---
+  {heading_list}
+  --- END ---
+
+  Return valid JSON only.
+  Your "classifications" array must contain exactly {heading_count} entries.
