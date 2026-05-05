@@ -220,6 +220,9 @@ async def ingest_examples(
     n_processed = 0
     n_skipped = 0
 
+    # Maps example_id → list of Qdrant point UUID strings (for KUZU sync).
+    processed_chunk_ids: dict[str, list[str]] = {}
+
     # Walk: examples_root/{example_group}/{example_id}/
     for group_dir in sorted(examples_root.iterdir()):
         if not group_dir.is_dir():
@@ -233,12 +236,6 @@ async def ingest_examples(
 
             if example_id_filter and example_id != example_id_filter:
                 continue
-
-            if not any_changed:
-                logger.debug("Example '%s/%s' unchanged \u2014 skipping.", example_group, example_id)
-                continue  # was_processed=False, no point_ids
-
-            logger.info("Processing example folder: %s/%s", example_group, example_id)
 
             tokens, was_processed, point_ids = await _ingest_example_folder(
                 example_dir=example_dir,
@@ -341,15 +338,17 @@ async def _ingest_example_folder(
     collection: str,
     stored_hashes: dict[str, str],
     dry_run: bool,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, list[str]]:
     """
     Process one example folder (e.g. ``Dashboard03/``).
 
     Returns
     -------
-    (tokens_used, was_processed)
+    (tokens_used, was_processed, point_ids)
         ``was_processed`` is ``False`` when the folder was skipped because
         nothing changed since the last ingest run.
+        ``point_ids`` is the list of Qdrant point UUID strings upserted
+        (empty when skipped or dry_run).
     """
     project_root = examples_root.parent
 
@@ -598,7 +597,7 @@ async def _ingest_example_folder(
 
     if not all_texts:
         logger.warning("No texts to embed for '%s/%s'.", example_group, example_id)
-        return 0, True
+        return 0, True, []
 
     # ── Embed all texts in one batch ──────────────────────────────────────────
     vectors, usage = await embedder.embed_texts(all_texts)

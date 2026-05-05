@@ -750,6 +750,27 @@ def _split_module_into_chunks(
             sub_tokens = 0
             for sub in [p.strip() for p in _re.split(r"\n{2,}", section) if p.strip()]:
                 st = count_tokens(sub)
+                # If even a single paragraph exceeds the budget, split at sentences
+                if st > budget_tokens:
+                    if sub_parts:
+                        chunks.append("\n\n".join(sub_parts))
+                        sub_parts  = []
+                        sub_tokens = 0
+                    sentences = _re.split(r"(?<=[.!?])\s+", sub)
+                    sent_parts: list[str] = []
+                    sent_tokens = 0
+                    for sent in sentences:
+                        stk = count_tokens(sent)
+                        if sent_tokens + stk > budget_tokens and sent_parts:
+                            chunks.append(" ".join(sent_parts))
+                            sent_parts  = [sent]
+                            sent_tokens = stk
+                        else:
+                            sent_parts.append(sent)
+                            sent_tokens += stk
+                    if sent_parts:
+                        chunks.append(" ".join(sent_parts))
+                    continue
                 if sub_tokens + st > budget_tokens and sub_parts:
                     chunks.append("\n\n".join(sub_parts))
                     sub_parts  = [sub]
@@ -793,7 +814,9 @@ def _split_module_into_chunks(
     total = len(merged)
     return [
         f"[Part {i + 1}/{total} of module '{module_name}'] "
-        f"— extract only requirements visible in this part.\n\n{chunk}"
+        f"— Extract ALL requirements, fields, rules, and behaviors visible in this part. "
+        f"Do NOT skip subsections, edge cases, or validation rules. "
+        f"Capture every field, every status value, every dropdown option, every business rule.\n\n{chunk}"
         for i, chunk in enumerate(merged)
     ]
 
@@ -1029,18 +1052,25 @@ async def _extract_chunk_for_mode(
 # rate-limit cascade that causes MODULE_EXTRACTION_TIMEOUT on large documents.
 
 _MODULE_SEMAPHORE: asyncio.Semaphore | None = None
+_MODULE_SEMAPHORE_LOOP: object | None = None  # track which event loop owns the semaphore
 
 
 def _get_module_semaphore() -> asyncio.Semaphore:
     """
     Return (lazily creating) the module-level concurrency semaphore.
 
-    Always called from within a running event loop (inside a coroutine),
-    so asyncio.Semaphore() is always bound to the correct loop.
+    The semaphore is re-created whenever the running event loop changes so that
+    background-task restarts and test teardowns don't leave a semaphore bound
+    to a closed loop (which causes 'attached to a different loop' errors).
     """
-    global _MODULE_SEMAPHORE
-    if _MODULE_SEMAPHORE is None:
+    global _MODULE_SEMAPHORE, _MODULE_SEMAPHORE_LOOP
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    if _MODULE_SEMAPHORE is None or current_loop is not _MODULE_SEMAPHORE_LOOP:
         _MODULE_SEMAPHORE = asyncio.Semaphore(MODULE_BATCH_SIZE)
+        _MODULE_SEMAPHORE_LOOP = current_loop
     return _MODULE_SEMAPHORE
 
 
@@ -1064,6 +1094,10 @@ async def _extract_module_body(slice_input: ModuleSlice) -> dict[str, Any]:
     module_name = slice_input["module_name"]
     module_text = slice_input["module_text"]
     mode        = slice_input["mode"]
+
+    # Cap raised to 20 (from 10) so large modules (ERP user stories) lose fewer
+    # requirements. Each chunk still fits within the token budget.
+    _MAX_CHUNKS = 20
 
     summary_prompt  = _load_prompt("summary_extraction")
     base_rules_text = _load_prompt("base_rules").get("rules", "")
@@ -1106,7 +1140,7 @@ async def _extract_module_body(slice_input: ModuleSlice) -> dict[str, Any]:
     if module_token_count <= token_budget:
         chunks = [module_text]
     else:
-        chunks = _split_module_into_chunks(module_text, token_budget, module_name)
+        chunks = _split_module_into_chunks(module_text, token_budget, module_name, max_chunks=_MAX_CHUNKS)
         logger.info(
             "extract_module_node: '%s' too large for single pass "
             "(%d tokens > budget %d) — splitting into %d chunk(s) for full coverage.",

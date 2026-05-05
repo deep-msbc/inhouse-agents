@@ -155,11 +155,11 @@ FRONTEND_SCHEMA: dict = {
     "properties": {
         "module": {
             "type": "object",
-            "required": ["name", "description", "screens"],
+            "required": ["name", "screens"],
             "additionalProperties": False,
             "properties": {
                 "name":        {"type": "string"},
-                "description": {"type": "string"},
+                "description": {"type": ["string", "null"]},
                 "screens": {
                     "type": "array",
                     "items": _SCREEN_SCHEMA,

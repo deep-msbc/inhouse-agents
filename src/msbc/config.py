@@ -80,13 +80,14 @@ except (ValueError, TypeError):
 # ── Per-module extraction timeout ────────────────────────────────────────────
 # Hard deadline (seconds) for the entire extract_module_node coroutine,
 # covering all parallel LLM calls (fe + be + summary) plus retries.
-# With LLM_MAX_CONCURRENCY raised to avoid queue-wait, worst-case is:
-#   SCHEMA_VALIDATION_RETRIES(3) × LLM_TIMEOUT(120s) = 360s per call slot.
-# Set to 600s to give genuine OpenAI slowness + retry budget room.
+# With max_chunks raised to 20 and mode=both running Phase A then Phase B,
+# worst-case per phase: ceil(20/LLM_MAX_CONCURRENCY) rounds × LLM_TIMEOUT(120s)
+#   × SCHEMA_VALIDATION_RETRIES(3) ≈ 2 × 360s = 720s across both phases.
+# Default raised to 900s to accommodate large modules without false timeouts.
 try:
-    MODULE_EXTRACTION_TIMEOUT: int = int(_os.environ.get("MODULE_EXTRACTION_TIMEOUT", "600"))
+    MODULE_EXTRACTION_TIMEOUT: int = int(_os.environ.get("MODULE_EXTRACTION_TIMEOUT", "900"))
 except (ValueError, TypeError):
-    MODULE_EXTRACTION_TIMEOUT = 600
+    MODULE_EXTRACTION_TIMEOUT = 900
 
 # ── Per-module extraction concurrency cap ─────────────────────────────────────
 # The Send fan-out in build_slices_node fires all N modules in parallel.

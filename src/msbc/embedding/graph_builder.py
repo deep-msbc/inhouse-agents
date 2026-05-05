@@ -323,8 +323,39 @@ def _insert_typedefs(conn: kuzu.Connection, import_path_filter: str) -> None:
         {
             "id": f"{import_path_filter}::FormFieldConfig",
             "name": "FormFieldConfig",
-            "description": "Individual field definition within a form section.",
-            "required_fields": ["name", "label", "type"],
+            "description": (
+                "Individual field definition within a form section. "
+                "Supports visibleIf (conditional visibility), "
+                "validation (required/requiredIf/requiredIfAny/minLength/maxLength/min/max/pattern/custom), "
+                "and depends (DependsConfig for dependent dropdowns)."
+            ),
+            "required_fields": ["name", "type"],
+        },
+        {
+            "id": f"{import_path_filter}::ValidationRule",
+            "name": "ValidationRule",
+            "description": (
+                "Validation rules for a ConfigurableForm field. "
+                "required: boolean or {message}; "
+                "requiredIf: {field, operator?, value?, message?}; "
+                "requiredIfAny: {fields[], message?}; "
+                "minLength/maxLength/min/max: number or {value, message}; "
+                "pattern: string or {value, message}; "
+                "custom: {fn: string, message: string}."
+            ),
+            "required_fields": [],
+        },
+        {
+            "id": f"{import_path_filter}::DependsConfig",
+            "name": "DependsConfig",
+            "description": (
+                "Dependent field wiring for ConfigurableForm. "
+                "fieldName: parent field key whose change triggers this field (NOT this field's own name). "
+                "api: {mapParamTo?, appendToUrl?} — appends parent value to API call. "
+                "confirm: {message} — shows confirmation before clearing. "
+                "populate: {from, to, transform?, onlyIfEmpty?} — auto-populates another field."
+            ),
+            "required_fields": ["fieldName"],
         },
     ]
 
@@ -417,7 +448,7 @@ def _insert_supports_fieldtype_edges(
     form_field_types = [
         "text", "email", "number", "password", "textarea", "tel",
         "select", "radio", "checkbox", "list",
-        "fileUpload", "map", "date", "date-range",
+        "fileUpload", "map", "date", "date-range", "custom",
     ]
     for ft in form_field_types:
         _exec_safe(conn, (

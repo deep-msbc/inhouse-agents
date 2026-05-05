@@ -31,6 +31,32 @@ from src.msbc.embedding.schema import make_chunk_id, text_hash as _text_hash
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Component guidance index (loaded once at module import)
+# Built from toolkit_knowledge.PACKAGES so embed text carries when_to_use /
+# do_not_use_when guidance — critical for retrieval accuracy.
+# ---------------------------------------------------------------------------
+
+def _build_component_guidance() -> dict[str, dict[str, list[str]]]:
+    """Return {component_name: {when_to_use: [...], do_not_use_when: [...]}}."""
+    try:
+        from src.msbc.agents.frontend_planner.toolkit_knowledge import PACKAGES
+        guidance: dict[str, dict[str, list[str]]] = {}
+        for pkg in PACKAGES.values():
+            for comp_name, meta in pkg.get("components", {}).items():
+                if not isinstance(meta, dict):
+                    continue
+                wtu = meta.get("when_to_use", [])
+                dnu = meta.get("do_not_use_when", [])
+                if wtu or dnu:
+                    guidance[comp_name] = {"when_to_use": wtu, "do_not_use_when": dnu}
+        return guidance
+    except Exception:  # noqa: BLE001 — never crash on import
+        return {}
+
+
+_COMPONENT_GUIDANCE: dict[str, dict[str, list[str]]] = _build_component_guidance()
+
+# ---------------------------------------------------------------------------
 # Token-envelope constants
 # ---------------------------------------------------------------------------
 
@@ -114,8 +140,8 @@ _FILE_UPLOAD_RE = re.compile(r"""type\s*:\s*['"]fileUpload['"]""")
 # Field type extraction from form configs
 _FIELD_TYPE_RE = re.compile(r"""type\s*:\s*['"](\w+)['"]""")
 _KNOWN_FORM_FIELD_TYPES: frozenset[str] = frozenset({
-    "text", "email", "number", "date", "select", "radio", "checkbox",
-    "textarea", "password", "tel", "custom", "fileUpload", "file",
+    "text", "email", "number", "date", "date-range", "select", "radio", "checkbox",
+    "textarea", "password", "tel", "custom", "fileUpload", "file", "list", "map",
     "multiselect", "switch", "toggle", "datepicker", "autocomplete",
 })
 
@@ -556,14 +582,17 @@ def build_embed_text(
     Build the enriched text string that will be vectorised.
 
     The context header placed before the code carries semantic metadata
-    (type, namespace, package, file, imports, exports) so that queries like
-    "ConfigurableForm component in config-ui" resolve correctly even when the
-    code itself does not repeat these words.
+    (type, namespace, package, file, imports, exports, when_to_use,
+    do_not_use_when) so that queries like "ConfigurableForm component in
+    config-ui" and "when should I use ConfigurableDashboard" resolve
+    correctly even when the code itself does not repeat these words.
 
     Format
     ------
     [{chunk_type}: {symbol_name}] [{namespace} / {file_category}]
     Package: {namespace} | File: {file_name}
+    Use when: {when_to_use bullet points}   <- only for known components
+    Do not use when: {do_not_use_when}      <- only for known components
     MSBC imports: {A, B, C}
     Exports: {X, Y}
     ---
@@ -574,6 +603,17 @@ def build_embed_text(
     label = f"{chunk_type}: {symbol_name}" if symbol_name else chunk_type
     header_parts.append(f"[{label}] [{namespace} / {file_category}]")
     header_parts.append(f"Package: {namespace} | File: {file_name}")
+
+    # Inject when_to_use / do_not_use_when from toolkit_knowledge when the
+    # symbol name matches a known component.  This travels inside the vector
+    # so retrieval queries about usage guidance hit the correct chunk.
+    guidance = _COMPONENT_GUIDANCE.get(symbol_name, {})
+    if guidance.get("when_to_use"):
+        wtu = " | ".join(guidance["when_to_use"])
+        header_parts.append(f"Use when: {wtu}")
+    if guidance.get("do_not_use_when"):
+        dnu = " | ".join(guidance["do_not_use_when"])
+        header_parts.append(f"Do not use when: {dnu}")
 
     if msbc_imports:
         header_parts.append(f"MSBC imports: {', '.join(msbc_imports[:8])}")
@@ -769,7 +809,7 @@ def _detect_dashboard_features(source: str) -> dict[str, Any]:
         if _FILTER_SELECT_RE.search(source):
             filter_types.append("select")
         if _FILTER_DATE_RE.search(source):
-            filter_types.append("date_range")
+            filter_types.append("date-range")
         if _FILTER_TEXT_RE.search(source):
             filter_types.append("text")
         if _FILTER_MULTISELECT_RE.search(source):
