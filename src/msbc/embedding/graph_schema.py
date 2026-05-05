@@ -7,15 +7,20 @@ on every startup or ``build_graph`` call.
 Node tables
 -----------
 Package       — @msbc/* npm package (e.g. @msbc/config-ui)
-Component     — exported React component or hook
+Component     — exported React component or hook  (semantic registry)
 TypeDef       — TypeScript interface / type used by a component
 Feature       — named capability flag  (e.g. has_search, has_filters)
 FieldType     — form field type  (e.g. fileUpload, select)
 Example       — one correct_code_examples/{group}/{id}/ folder
 ExampleFile   — one source file within an Example folder
 
-Relationship tables
--------------------
+Code-graph node tables (built from scanning the actual monorepo source)
+------------------------------------------------------------------------
+SourceFile    — one .ts / .tsx file inside a package
+ExportedSymbol— a named symbol exported by a SourceFile
+
+Relationship tables (semantic graph)
+-------------------------------------
 BelongsTo           Component → Package
 InternallyUses      Component → Component  (orchestration / composition)
 UsesType            Component → TypeDef    (config prop or generic param)
@@ -25,6 +30,15 @@ SupportsFieldType   Component → FieldType
 DemonstratesComponent Example → Component
 ExhibitsFieldType   Example → FieldType
 HasFile             Example → ExampleFile
+
+Relationship tables (code graph)
+----------------------------------
+FileBelongsTo        SourceFile → Package
+ImportsFrom          SourceFile → SourceFile   (intra-package resolved imports)
+ImportsPackage       SourceFile → Package      (cross-package / external imports)
+ExportsSymbol        SourceFile → ExportedSymbol
+ReExportsFrom        SourceFile → SourceFile   (export * from '...')
+SymbolLinkedToComponent ExportedSymbol → Component  (code ↔ semantic link)
 """
 
 from __future__ import annotations
@@ -175,11 +189,87 @@ CREATE REL TABLE IF NOT EXISTS HasFile(
 """
 
 # ---------------------------------------------------------------------------
+# Code-graph node table DDL  (built from scanning the real monorepo)
+# ---------------------------------------------------------------------------
+
+# Primary key: "{package_name}::{rel_path}"
+# e.g. "@msbc/config-ui::src/components/ConfigurableDashboard/ConfigurableDashboard.tsx"
+CREATE_SOURCEFILE = """
+CREATE NODE TABLE IF NOT EXISTS SourceFile(
+    id           STRING,
+    file_name    STRING,
+    rel_path     STRING,
+    package_name STRING,
+    file_type    STRING,
+    PRIMARY KEY (id)
+)
+"""
+
+# Primary key: "{package_name}::{symbol_name}"
+# e.g. "@msbc/config-ui::ConfigurableDashboard"
+CREATE_EXPORTEDSYMBOL = """
+CREATE NODE TABLE IF NOT EXISTS ExportedSymbol(
+    id           STRING,
+    name         STRING,
+    symbol_type  STRING,
+    package_name STRING,
+    PRIMARY KEY (id)
+)
+"""
+
+# ---------------------------------------------------------------------------
+# Code-graph relationship table DDL
+# ---------------------------------------------------------------------------
+
+CREATE_FILE_BELONGS_TO = """
+CREATE REL TABLE IF NOT EXISTS FileBelongsTo(
+    FROM SourceFile TO Package
+)
+"""
+
+# Import of another file within the same (or different) package — resolved.
+# import_specifiers: list of named symbols imported (e.g. ['Button', 'ButtonProps'])
+CREATE_IMPORTS_FROM = """
+CREATE REL TABLE IF NOT EXISTS ImportsFrom(
+    FROM SourceFile TO SourceFile,
+    import_specifiers STRING[]
+)
+"""
+
+# Import from an @msbc/* package (cross-package or external npm package).
+CREATE_IMPORTS_PACKAGE = """
+CREATE REL TABLE IF NOT EXISTS ImportsPackage(
+    FROM SourceFile TO Package,
+    import_specifiers STRING[]
+)
+"""
+
+CREATE_EXPORTS_SYMBOL = """
+CREATE REL TABLE IF NOT EXISTS ExportsSymbol(
+    FROM SourceFile TO ExportedSymbol
+)
+"""
+
+# export * from './path'  →  source re-exports everything from target
+CREATE_REEXPORTS_FROM = """
+CREATE REL TABLE IF NOT EXISTS ReExportsFrom(
+    FROM SourceFile TO SourceFile
+)
+"""
+
+# Bridge between the code graph and the semantic component registry.
+CREATE_SYMBOL_LINKED_TO_COMPONENT = """
+CREATE REL TABLE IF NOT EXISTS SymbolLinkedToComponent(
+    FROM ExportedSymbol TO Component
+)
+"""
+
+# ---------------------------------------------------------------------------
 # Ordered list of all DDL statements (node tables first, then rel tables)
 # ---------------------------------------------------------------------------
 
 ALL_DDL: list[str] = [
-    # Node tables
+    # Semantic node tables
     CREATE_PACKAGE,
     CREATE_COMPONENT,
     CREATE_TYPEDEF,
@@ -187,7 +277,10 @@ ALL_DDL: list[str] = [
     CREATE_FIELDTYPE,
     CREATE_EXAMPLE,
     CREATE_EXAMPLEFILE,
-    # Relationship tables
+    # Code-graph node tables
+    CREATE_SOURCEFILE,
+    CREATE_EXPORTEDSYMBOL,
+    # Semantic relationship tables
     CREATE_BELONGS_TO,
     CREATE_INTERNALLY_USES,
     CREATE_USES_TYPE,
@@ -197,6 +290,13 @@ ALL_DDL: list[str] = [
     CREATE_DEMONSTRATES_COMPONENT,
     CREATE_EXHIBITS_FIELD_TYPE,
     CREATE_HAS_FILE,
+    # Code-graph relationship tables
+    CREATE_FILE_BELONGS_TO,
+    CREATE_IMPORTS_FROM,
+    CREATE_IMPORTS_PACKAGE,
+    CREATE_EXPORTS_SYMBOL,
+    CREATE_REEXPORTS_FROM,
+    CREATE_SYMBOL_LINKED_TO_COMPONENT,
 ]
 
 # ---------------------------------------------------------------------------
@@ -204,7 +304,14 @@ ALL_DDL: list[str] = [
 # ---------------------------------------------------------------------------
 
 DROP_ORDER: list[str] = [
-    # Relationship tables first
+    # Code-graph relationship tables first (they reference both graphs)
+    "SymbolLinkedToComponent",
+    "ReExportsFrom",
+    "ExportsSymbol",
+    "ImportsPackage",
+    "ImportsFrom",
+    "FileBelongsTo",
+    # Semantic relationship tables
     "HasFile",
     "ExhibitsFieldType",
     "DemonstratesComponent",
@@ -214,7 +321,10 @@ DROP_ORDER: list[str] = [
     "UsesType",
     "InternallyUses",
     "BelongsTo",
-    # Node tables
+    # Code-graph node tables
+    "ExportedSymbol",
+    "SourceFile",
+    # Semantic node tables
     "ExampleFile",
     "Example",
     "FieldType",
@@ -256,5 +366,5 @@ ALL_FEATURES: list[tuple[str, str]] = [
 ALL_FIELD_TYPES: list[str] = [
     "text", "email", "number", "password", "textarea", "tel",
     "select", "radio", "checkbox", "list",
-    "fileUpload", "map", "date", "date-range",
+    "fileUpload", "map", "date", "date-range", "custom",
 ]

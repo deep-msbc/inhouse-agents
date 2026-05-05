@@ -13,11 +13,19 @@ rules: |
     "Directly implied" means: if the doc says "user can add X", an Add form
     exists even if not named. It does NOT mean you may infer unmentioned fields.
 
-  COMPLETENESS:
-    Capture EVERY distinct requirement in the module text provided. Do not
-    silently drop edge cases, validation rules, status values, dropdown
-    options, business constraints, or workflow steps. If the document lists
-    values (statuses, options, roles), list ALL of them — not a sample.
+  COMPLETENESS — TARGET 100% CAPTURE:
+    You MUST capture EVERY distinct requirement in the text. Missing even one
+    field, rule, or status value is a failure. Apply these rules strictly:
+    • Every numbered sub-section (e.g. "8.3 Filter Panel", "8.16 Transaction
+      History") MUST be fully extracted — never skip a subsection.
+    • Every table row is data: column headers → field names, row values → options.
+    • Every bullet point is a requirement: capture it as a field, rule, or behavior.
+    • Every status/dropdown value listed MUST appear — list ALL, never abbreviate.
+    • Every business rule, validation, and constraint MUST be captured.
+    • Edge cases, error conditions, and "else" branches are requirements too.
+    • If the document lists values (statuses, options, roles), list ALL of them.
+    • Sub-tabs within a tab are screens/components — never omit them.
+    • "Optional" or "Recommended" sections contain real requirements — capture them.
 
   EXACTNESS:
     Use the exact domain language from the document. Preserve proper nouns,
