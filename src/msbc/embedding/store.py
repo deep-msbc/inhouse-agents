@@ -24,6 +24,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     FilterSelector,
+    MatchAny,
     MatchValue,
     PointStruct,
     VectorParams,
@@ -297,3 +298,125 @@ class QdrantStore:
             collection,
         )
         return hashes
+
+    # ------------------------------------------------------------------
+    # Retrieval helpers (used by code-generator agent)
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        collection: str,
+        query_vector: list[float],
+        filters: dict | None = None,
+        top_k: int = 15,
+    ) -> list[dict]:
+        """
+        Vector similarity search with optional payload filters.
+
+        Parameters
+        ----------
+        collection : str
+            Target collection name.
+        query_vector : list[float]
+            Dense embedding vector to search against.
+        filters : dict, optional
+            Supported keys:
+              - ``content_type``: str or list[str] — matched with MatchAny/MatchValue
+              - ``language``:     str — matched with MatchValue
+        top_k : int
+            Maximum number of results to return.
+
+        Returns
+        -------
+        list[dict]
+            Each entry: ``{"id": str, "score": float, "payload": dict}``.
+        """
+        must: list = []
+
+        if filters:
+            ct = filters.get("content_type")
+            if ct:
+                if isinstance(ct, list):
+                    must.append(FieldCondition(key="content_type", match=MatchAny(any=ct)))
+                else:
+                    must.append(FieldCondition(key="content_type", match=MatchValue(value=ct)))
+
+            lang = filters.get("language")
+            if lang:
+                must.append(FieldCondition(key="language", match=MatchValue(value=lang)))
+
+        search_filter = Filter(must=must) if must else None
+
+        response = self._client.query_points(
+            collection_name=collection,
+            query=query_vector,
+            query_filter=search_filter,
+            limit=top_k,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        return [
+            {"id": str(r.id), "score": r.score, "payload": r.payload or {}}
+            for r in response.points
+        ]
+
+    def scroll_by_file_path(self, collection: str, file_path: str) -> list[dict]:
+        """Return all chunks for *file_path* from *collection*, sorted by chunk_index."""
+        results: list[dict] = []
+        offset = None
+
+        while True:
+            points, next_offset = self._client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="file_path",
+                            match=MatchValue(value=file_path),
+                        )
+                    ]
+                ),
+                with_payload=True,
+                with_vectors=False,
+                limit=SCROLL_PAGE_SIZE,
+                offset=offset,
+            )
+
+            for point in points:
+                payload = point.payload or {}
+                results.append({"id": str(point.id), **payload})
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        results.sort(key=lambda p: p.get("chunk_index", 0))
+        logger.debug(
+            "scroll_by_file_path: %d chunks for '%s' in '%s'.",
+            len(results),
+            file_path,
+            collection,
+        )
+        return results
+
+    def get_by_ids(self, collection: str, ids: list[str]) -> list[dict]:
+        """Return exact Qdrant points by point IDs (used for Kuzu example chunks)."""
+        if not ids:
+            return []
+
+        points = self._client.retrieve(
+            collection_name=collection,
+            ids=ids,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        results = [{"id": str(p.id), **(p.payload or {})} for p in points]
+        logger.debug(
+            "get_by_ids: retrieved %d/%d points from '%s'.",
+            len(results),
+            len(ids),
+            collection,
+        )
+        return results

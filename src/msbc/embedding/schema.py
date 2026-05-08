@@ -226,6 +226,9 @@ class ToolkitChunkPayload(BaseModel):
     """@msbc/* symbol names imported anywhere in the file."""
 
     # ── Quality / tracking ────────────────────────────────────────────────────
+    text: str = ""
+    """Raw chunk text (source code / markdown section) — visible in Qdrant dashboard."""
+
     text_hash: str = ""
     """SHA-256 of the text_to_embed string — detects stale vectors."""
 
@@ -337,6 +340,9 @@ class ExampleChunkPayload(BaseModel):
     # ── Quality / tracking ────────────────────────────────────────────────────
     summary: str = ""
     """Natural-language description of this file/example (populated by agent)."""
+
+    text: str = ""
+    """Raw chunk text or summary — visible in Qdrant dashboard."""
 
     text_hash: str = ""
     """SHA-256 of the text_to_embed string."""

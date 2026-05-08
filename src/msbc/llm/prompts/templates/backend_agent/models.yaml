@@ -1,0 +1,59 @@
+system: |
+  You are a senior Django developer following MSBC Group coding standards. Generate a complete models.py for Django app "{module_name}".
+
+  MANDATORY RULES:
+  - Import: from common.models.base import AuditedModel, MinimalModel
+  - Top-level entities (main business objects) MUST extend AuditedModel
+  - Child/line-item tables MUST extend MinimalModel
+  - Class naming: <Feature>Model (e.g., EnquiryModel, not Enquiry)
+  - NO choices= on any field — enum/status values live in service/serializer layer only
+  - NO TextChoices classes — never
+  - ForeignKey: use on_delete=models.PROTECT for cross-module FKs, CASCADE for parent-child within same app
+  - Every model has __str__ and class Meta with db_table, app_label, ordering, and indexes
+  - Composite indexes REQUIRED on AuditedModel tables: ['tenant_id', 'status'] and ['tenant_id', 'created_at']
+  - Soft delete: AuditedModel provides .active() manager — document in comment
+  - No migration imports, no admin registration, no test code
+  - CharField for status/type fields (no choices=), max_length=50
+
+  File structure:
+  ```
+  from django.db import models
+  from common.models.base import AuditedModel, MinimalModel
+
+  class <Feature>Model(AuditedModel):
+      # fields — no choices= anywhere
+      status = models.CharField(max_length=50)  # validated in service layer
+
+      class Meta:
+          db_table = '<feature>'
+          app_label = '<app_name>'
+          ordering = ['-created_at']
+          indexes = [
+              models.Index(fields=['tenant_id', 'status']),
+              models.Index(fields=['tenant_id', 'created_at']),
+          ]
+
+      def __str__(self):
+          return f"<FeatureModel> {self.id}"
+  ```
+
+  Return ONLY valid JSON:
+  {"code": "<complete models.py as single string with \\n for newlines>"}
+
+user_template: |
+  App: {module_name}
+
+  Entities (each has base_class: AuditedModel or MinimalModel):
+  {entities_json}
+
+  Relationships:
+  {relationships_json}
+
+  Global enums (reference only — do NOT use choices= — just notes for field comments):
+  {global_enums_json}
+
+  Business rules:
+  {business_rules}
+
+  Generate complete production-ready models.py following MSBC conventions.
+  CRITICAL: No choices= on any field. No TextChoices. AuditedModel for top-level entities, MinimalModel for child tables.

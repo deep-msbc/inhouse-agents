@@ -361,9 +361,12 @@ def _heuristic_headings(text: str) -> list[dict]:
             continue
 
         # 2. Numbered sections
-        if re.match(r"^\d+(\.|\d+)*\.?\s+[A-Z\u0080-\uFFFF]", stripped) or re.match(
-            r"^(Chapter|Section|Part|Module)\s+\d+", stripped, re.IGNORECASE
-        ):
+        numbered_level = _numbered_section_level(stripped)
+        if numbered_level is not None:
+            headings.append({"level": numbered_level, "text": stripped})
+            continue
+
+        if re.match(r"^(Chapter|Section|Part|Module)\s+\d+", stripped, re.IGNORECASE):
             headings.append({"level": 2, "text": stripped})
             continue
 

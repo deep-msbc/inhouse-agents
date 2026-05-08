@@ -139,9 +139,12 @@ def _heuristic_headings(text: str) -> list[dict]:
             continue
 
         # 2. Numbered sections
-        if re.match(r"^\d+(\.|\d+)*\.?\s+[A-Z\u0080-\uFFFF]", stripped) or re.match(
-            r"^(Chapter|Section|Part|Module)\s+\d+", stripped, re.IGNORECASE
-        ):
+        numbered_level = _numbered_section_level(stripped)
+        if numbered_level is not None:
+            headings.append({"level": numbered_level, "text": stripped})
+            continue
+
+        if re.match(r"^(Chapter|Section|Part|Module)\s+\d+", stripped, re.IGNORECASE):
             headings.append({"level": 2, "text": stripped})
             continue
 
@@ -204,3 +207,19 @@ def _clean_text(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
+
+
+def _numbered_section_level(text: str) -> int | None:
+    """
+    Detect a numbered heading and preserve its nesting depth.
+
+    Examples:
+        "8. Production Tracking" -> 2
+        "8.1 Batch Tracking"     -> 3
+        "8.1.1 Scan Rules"       -> 4
+    """
+    match = re.match(r"^(\d+(?:\.\d+)*)\.?\s+\S", text)
+    if not match:
+        return None
+    depth = len(match.group(1).split("."))
+    return min(depth + 1, 6)

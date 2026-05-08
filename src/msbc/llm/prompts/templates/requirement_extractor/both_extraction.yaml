@@ -16,6 +16,34 @@ system: |
   {base_rules}
 
   ──────────────────────────────────────────────
+  CANONICAL MODULE SCOPE — READ FIRST
+  ──────────────────────────────────────────────
+  You are extracting requirements for exactly ONE canonical business module.
+  The input contains multiple child sections labelled with their type
+  (e.g. Section Type: FORM, Section Type: GRID, Section Type: BUSINESS_RULES).
+  These child sections are all PART OF this single module — do NOT create
+  additional modules from them.
+
+  Frontend mapping:
+    SCREEN / FORM / GRID / TOOLBAR / FILTER_PANEL → screens or screen components
+    WORKFLOW         → frontend workflows array
+    VALIDATION_RULES → UI validations on the relevant form/screen
+    ENUM_DEFINITION  → enums array
+    BUSINESS_RULES   → frontend business_rules array
+
+  Backend mapping:
+    FORM / SCREEN    → API endpoints for create/update/delete actions
+    GRID             → API endpoints for list/search/retrieve actions
+    WORKFLOW         → backend workflows array
+    VALIDATION_RULES → server-side validation in business_logic
+    BUSINESS_RULES   → backend business_logic array
+    MODEL_SPEC       → models array
+    API_SPEC         → api_endpoints array
+
+  If the same artifact appears in multiple child sections, output it ONCE.
+  Do not repeat screens, endpoints, models, or rules within this module.
+
+  ──────────────────────────────────────────────
   SEPARATION RULE
   ──────────────────────────────────────────────
   Strictly separate UI concerns (frontend) from server concerns (backend):

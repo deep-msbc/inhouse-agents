@@ -1,11 +1,19 @@
 """
 Node implementations for the requirement extractor LangGraph workflow.
 
-Phases:
-  0   — segmentation_node     : identify modules (1 LLM call)
-  0.5 — build_slices_node     : pure-Python fan-out via Send API
-  1   — extract_module_node   : extraction + summary per module (parallel)
-  2   — finalize_node         : pure-Python collect + graph-builder LLM call
+New Phase 1 pipeline (chunk-based, replaces section_classifier_node):
+  document_chunker_node   — pure Python, coarse document chunks
+  module_inventory_node   — 1 LLM call on chunk outline → module candidates
+  module_normalizer_node  — Python merge rules + optional LLM → canonical modules
+  chunk_router_node       — pure Python deterministic chunk → module routing
+  module_bundle_builder_node — assembles combined_text per canonical module
+
+Downstream (unchanged):
+  extract_module_node × N — parallel extraction per module (Send fan-out)
+  artifact_index_node     — pure Python artifact catalog
+  global_deduplication_node — pure Python deduplication
+  finalize_node           — pure-Python collect + graph-builder LLM call
+  requirement_linter_node — deterministic quality gate
 """
 
 import asyncio
@@ -19,7 +27,6 @@ import yaml
 
 from src.msbc.agents.schemas.requirement_extractor import (
     BACKEND_SCHEMA,
-    CLASSIFICATION_SCHEMA,
     COMBINED_SCHEMA,
     FRONTEND_SCHEMA,
     GRAPH_OUTPUT_SCHEMA,
@@ -281,347 +288,480 @@ def _normalize_extraction(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-# ── Phase 0: Segmentation ─────────────────────────────────────────────────────
+# ── Phase 1 (new): Document Chunker ──────────────────────────────────────────
 
-def _pre_clean_headings(heading_hierarchy: list[dict]) -> list[dict]:
+def document_chunker_node(state: ExtractionState) -> dict[str, Any]:
     """
-    Lightweight Python pre-cleanup before the LLM holistic module selection call.
+    Split the document into 3-10 coarse business-area chunks (pure Python, no LLM).
 
-    Python's job is ONLY to remove obvious structural noise — blank entries,
-    excessively long paragraphs accidentally tagged as headings, emoji-prefixed
-    decorative callouts, and field-label headings (e.g. "Module Name: X").
-    All semantic decisions (module vs. sub-section vs. UI element) are delegated
-    entirely to the LLM so that genuine module headings are never silently dropped.
+    Replaces section_classifier_node's heading-tree construction entirely.
+    Uses heading_normalization + document_chunking utilities.
 
-    Filters applied (in order):
-      1. Blank headings removed.
-      2. Top three heading levels are kept — deeper levels (L4+) are very rarely
-         module boundaries but L3 can contain named masters or process steps.
-      3. Headings > 150 characters removed — these are paragraphs accidentally
-         formatted as headings in Word (real titles are short).
-      4. Emoji / symbol starters removed (U+2600+) — decorative section markers.
-      5. Explicit field-label headings removed — "Module Name: X", "Section Title: Y".
-      6. Deduplicated by exact text (first occurrence wins).
-
-    Intentionally NOT filtered here (let the LLM decide):
-      • Dotted sub-sections ("2.1 Purpose", "3.4 Business Rules") — the LLM
-        prompt explicitly excludes them, but they provide useful structural
-        context for adjacent headings.
-      • Broad document-title headings ("Job Module") — LLM rules handle them.
-      • UI component names ("Filter Panel") — LLM rules handle them.
-
-    Returns a new list of heading dicts (same shape: {level, text}).
+    Reads:  state["document_text"], state["heading_hierarchy"]
+    Writes: state["document_chunks"]
     """
-    import re as _re
+    from src.msbc.orchestration.utils.document_chunking import build_document_chunks
 
-    if not heading_hierarchy:
-        return []
-
-    _label_re = _re.compile(
-        r"^(module\s*(name|no\.?|number|title)|section\s+title)\s*[:—\-]",
-        _re.IGNORECASE,
-    )
-
-    # Determine the three shallowest levels present so L3 masters/steps are included.
-    all_levels = sorted({
-        h.get("level", 99)
-        for h in heading_hierarchy
-        if (h.get("text") or "").strip()
-    })
-    keep_levels: set[int] = set(all_levels[:3])
-
-    seen: set[str] = set()
-    cleaned: list[dict] = []
-
-    for h in heading_hierarchy:
-        level = h.get("level", 99)
-        text  = (h.get("text") or "").strip()
-
-        if not text:
-            continue
-        if level not in keep_levels:
-            continue
-        if len(text) > 150:
-            continue
-        if ord(text[0]) >= 0x2600:
-            continue
-        if _label_re.match(text):
-            continue
-        if text in seen:
-            continue
-
-        seen.add(text)
-        cleaned.append({"level": level, "text": text})
-
-    logger.info(
-        "_pre_clean_headings: %d of %d heading(s) kept after pre-clean "
-        "(levels kept: %s).",
-        len(cleaned), len(heading_hierarchy), sorted(keep_levels),
-    )
-    return cleaned
-
-
-def _heading_to_module_name(heading: str) -> str:
-    """
-    Derive a clean 2-6 word module name from a raw heading string when the
-    LLM does not provide one.  Strips leading number prefixes and parenthetical
-    suffixes like "(Final Document)", "(FINAL – WITH BATCH LAYER)".
-
-    Examples:
-      "8. Material Issue With Job"                 → "Material Issue With Job"
-      "Step 1 – How Purchase Order is Created"     → "How Purchase Order is Created"
-      "Material Consumption (Against Job) – Final" → "Material Consumption"
-    """
-    import re as _re
-
-    name = heading.strip()
-    name = _re.sub(r"^\d+\.\s*", "", name)
-    name = _re.sub(r"^(Step|Phase|Stage)\s+\d+\s*[–\-]\s*", "", name, flags=_re.IGNORECASE)
-    name = _re.sub(
-        r"\s*[\(–\-].*?(final|document|updated|complete|version)[^\)]*\)?$",
-        "", name, flags=_re.IGNORECASE,
-    ).strip()
-    name = name.rstrip("–-— ").strip()
-    return name or heading[:50]
-
-
-def _select_module_candidates(cleaned_headings: list[dict]) -> list[dict]:
-    """
-    Reduce pre-cleaned headings to structural module candidates before the LLM call.
-
-    Real modules are "container" headings — they own multiple sub-sections below
-    them.  Leaf sections (Validation Rules, Business Rules, Save Logic, etc.) have
-    zero sub-headings and must never reach the LLM.
-
-    Algorithm (two passes):
-      Pass 1 — Level selection:
-        Walk levels from shallowest to deepest.
-        Skip singleton levels (1 heading = document title).
-        Return the first level whose heading count is in [2, MAX_MODULE_COUNT].
-        This handles the common case: the shallowest non-singleton level is
-        exactly the module level (e.g. 5 L1 headings for 5 top-level modules).
-
-      Pass 2 — Sub-heading count filter (only when Pass 1 level has > MAX_MODULE_COUNT):
-        Among headings at the overcrowded level, keep only those with >= MIN_CHILDREN
-        sub-headings immediately below them.  Leaf / near-leaf sections are excluded.
-
-      Fallback: return all cleaned headings so the pipeline can still proceed.
-
-    Typical result: 3–20 candidates instead of 100–200, making LLM classification
-    accurate and fast.
-    """
-    import collections as _col
-
-    MAX_MODULE_COUNT = 25
-    MIN_CHILDREN     = 4
-
-    if not cleaned_headings:
-        return cleaned_headings
-
-    n = len(cleaned_headings)
-
-    by_level: dict[int, list[dict]] = _col.defaultdict(list)
-    for h in cleaned_headings:
-        by_level[h["level"]].append(h)
-
-    # Pre-compute each heading's index for O(1) position lookup
-    pos_map: dict[int, int] = {id(h): i for i, h in enumerate(cleaned_headings)}
-
-    def _child_count(h: dict) -> int:
-        """Count sub-headings that follow h before the next sibling/parent heading."""
-        start = pos_map[id(h)]
-        level = h["level"]
-        count = 0
-        for j in range(start + 1, n):
-            if cleaned_headings[j]["level"] <= level:
-                break
-            count += 1
-        return count
-
-    for level in sorted(by_level.keys()):
-        headings_at_level = by_level[level]
-        count = len(headings_at_level)
-
-        if count <= 1:
-            # Singleton = document title; skip to the next (deeper) level.
-            continue
-
-        if count <= MAX_MODULE_COUNT:
-            # Perfect module count — use this level directly.
-            logger.info(
-                "_select_module_candidates: L%d — %d heading(s) selected.",
-                level, count,
-            )
-            return headings_at_level
-
-        # More than MAX_MODULE_COUNT headings at this level.
-        # Filter to structural containers (>= MIN_CHILDREN sub-headings).
-        filtered = [h for h in headings_at_level if _child_count(h) >= MIN_CHILDREN]
-
-        if len(filtered) >= 2:
-            logger.info(
-                "_select_module_candidates: L%d — %d candidate(s) "
-                "(filtered from %d, min %d children).",
-                level, len(filtered), count, MIN_CHILDREN,
-            )
-            return filtered
-
-        # Fewer than 2 containers at this level — try the next deeper level.
-
-    logger.info(
-        "_select_module_candidates: fallback — using all %d cleaned heading(s).",
-        len(cleaned_headings),
-    )
-    return cleaned_headings
-
-
-async def segmentation_node(state: ExtractionState) -> dict[str, Any]:
-    """
-    Identify top-level modules using structural pre-filtering + LLM classification.
-
-    Strategy:
-      1. Python pre-clean: remove structural noise (blank, too long, emoji,
-         field-label headings). Top-3 heading levels kept.
-      2. Structural candidate selection: from ~100-200 cleaned headings, keep
-         only those that are structural containers — the shallowest heading level
-         with 2-25 entries, or (when a level is overcrowded) only the headings
-         at that level with >= 4 direct sub-headings.  Leaf sections like
-         "Business Rules", "Validation Rules", "Save Logic" are dropped here
-         without ever reaching the LLM.  Result: 3-25 candidates.
-      3. LLM classification: receives 3-25 candidates and classifies each as
-         MODULE or IGNORE.  Small input = accurate decisions.
-      4. Python filter: keep only MODULE headings, enforce document order.
-      5. Fallback: if no MODULE headings found, treat whole document as one module.
-    """
-    logger.info("segmentation_node: classifying headings via LLM.")
-    prompt_data = _load_prompt("segmentation")
-
-    # ── Step 1: Python pre-clean ──────────────────────────────────────────────
+    document_text: str = state.get("document_text") or ""
     heading_hierarchy: list[dict] = state.get("heading_hierarchy") or []
-    cleaned_headings = _pre_clean_headings(heading_hierarchy)
-
-    if not cleaned_headings:
-        logger.warning(
-            "segmentation_node: no headings after pre-clean; "
-            "falling back to single-module."
-        )
-        return {
-            "modules": [{
-                "name": "Application",
-                "heading": "",
-                "level": 1,
-                "description": "Full document",
-            }],
-            "all_usage": [],
-        }
-
-    # ── Step 1b: Structural candidate selection ───────────────────────────────
-    # Reduces 100-200 cleaned headings to 3-25 structural module candidates.
-    # Only headings that "own" multiple sub-sections are module candidates;
-    # leaf sections (Business Rules, Validation Rules, Save Logic, …) are dropped.
-    # The position_index is built from the full cleaned list so document order
-    # is preserved correctly even though the LLM receives only the candidates.
-    candidates = _select_module_candidates(cleaned_headings)
-
-    # ── Step 2: Build heading list for LLM ────────────────────────────────────
-    position_index: dict[str, int] = {}
-    for pos, h in enumerate(cleaned_headings):     # full list for accurate ordering
-        text = h["text"]
-        if text not in position_index:
-            position_index[text] = pos
-
-    heading_lines: list[str] = [
-        f"[L{h['level']}] {h['text']}" for h in candidates
-    ]
-    heading_list_text = "\n".join(heading_lines)
-    heading_count = len(candidates)
-
-    user_prompt = _fmt(
-        prompt_data["user_template"],
-        heading_list=heading_list_text,
-        heading_count=str(heading_count),
-    )
 
     logger.info(
-        "segmentation_node: classifying %d candidate(s) (from %d cleaned) with LLM.",
-        heading_count, len(cleaned_headings),
+        "document_chunker_node: chunking document (%d chars, %d headings).",
+        len(document_text), len(heading_hierarchy),
     )
 
-    # ── Step 3: LLM per-heading classification ────────────────────────────────
-    # CLASSIFICATION_SCHEMA — LLM returns [{heading, type, module_name, description}]
-    # for every input heading.  Python keeps only type=="MODULE".
+    chunks = build_document_chunks(document_text, heading_hierarchy)
+
+    logger.info(
+        "document_chunker_node: produced %d chunk(s): %s",
+        len(chunks),
+        [c.get("title_hint") or c["chunk_id"] for c in chunks],
+    )
+    return {"document_chunks": chunks}
+
+
+# ── Phase 1 (new): Module Inventory ──────────────────────────────────────────
+
+async def module_inventory_node(state: ExtractionState) -> dict[str, Any]:
+    """
+    Discover business module candidates with a single LLM call on chunk summaries.
+
+    Sends the LLM only a compact outline (chunk title hints + local headings),
+    NOT the full document text. Token cost: ~400-800 tokens for a 35k doc.
+
+    Replaces section_classifier_node's 5+ sequential batched LLM calls.
+
+    Reads:  state["document_chunks"]
+    Writes: state["module_candidates"], state["all_usage"]
+    """
+    from src.msbc.agents.schemas.requirement_extractor.module_inventory import (
+        MODULE_INVENTORY_SCHEMA,
+    )
+    from src.msbc.orchestration.utils.module_normalization import make_module_key
+
+    chunks: list[dict] = state.get("document_chunks") or []
+
+    if not chunks:
+        logger.warning("module_inventory_node: no document_chunks; returning empty candidates.")
+        return {"module_candidates": [], "all_usage": []}
+
+    # Build compact outline — title hints + local headings only
+    # Include chunk_strategy so the LLM knows whether these are structured peers
+    chunk_strategies = {c["chunk_id"]: c.get("chunk_strategy", "unknown") for c in chunks}
+    unique_strategies = set(chunk_strategies.values())
+    strategy_hint = (
+        "numbered_sections" if "numbered_sections" in unique_strategies
+        else "major_headings" if "major_headings" in unique_strategies
+        else "token_window"
+    )
+
+    outline_lines: list[str] = []
+    if strategy_hint in ("numbered_sections", "major_headings"):
+        outline_lines.append(
+            f"NOTE: These {len(chunks)} chunks were split by document headings "
+            f"(strategy: {strategy_hint}). Each chunk corresponds to a distinct "
+            f"heading in the document. Peer-level chunks MUST each be a separate "
+            f"module candidate unless one is clearly a rule/validation section."
+        )
+        outline_lines.append("")
+
+    for chunk in chunks:
+        title = chunk.get("title_hint") or chunk["chunk_id"]
+        outline_lines.append(f'Chunk {chunk["chunk_id"]}: "{title}"')
+        local = chunk.get("local_headings") or []
+        if local:
+            headings_str = ", ".join(local[:20])  # cap at 20 headings per chunk
+            outline_lines.append(f"  Sub-headings: {headings_str}")
+        outline_lines.append("")
+
+    document_outline = "\n".join(outline_lines).strip()
+
+    prompt = _load_prompt("module_inventory")
+    system_text = prompt["system"]
+    user_text = _fmt(
+        prompt["user_template"],
+        document_outline=document_outline,
+        chunk_count=str(len(chunks)),
+    )
+
+    # Token budget check
+    total_tokens = count_tokens(system_text) + count_tokens(user_text)
+    logger.info(
+        "module_inventory_node: calling LLM with %d tokens (outline for %d chunks).",
+        total_tokens, len(chunks),
+    )
+
     result, usages = await call_llm_with_schema(
-        system_prompt=prompt_data["system"],
-        user_prompt=user_prompt,
-        schema=CLASSIFICATION_SCHEMA,
-        schema_name="segmentation_classify",
+        system_prompt=system_text,
+        user_prompt=user_text,
+        schema=MODULE_INVENTORY_SCHEMA,
+        schema_name="module_inventory",
     )
 
-    classifications: list[dict] = result.get("classifications", [])
+    candidates: list[dict] = result.get("module_candidates") or []
 
-    # ── Step 4: Filter MODULE headings, enrich, enforce document order ─────────
-    level_by_heading: dict[str, int] = {h["text"]: h["level"] for h in cleaned_headings}
-    seen_headings: set[str] = set()
-    enriched: list[dict[str, Any]] = []
+    # ── Post-LLM recovery: catch chunks the LLM silently dropped ─────────────
+    # If a chunk has a non-trivial title and meaningful internal structure
+    # (local_headings or token count > 300) but doesn't appear in any candidate's
+    # evidence_chunk_ids, the LLM forgot it. We create a recovery candidate so
+    # routing and extraction still cover that content.
+    #
+    # This is purely structural: no vocabulary checks. A chunk is considered
+    # "substantive" if it has internal sub-headings OR substantial text.
+    represented_ids: set[str] = set()
+    for c in candidates:
+        for cid in (c.get("evidence_chunk_ids") or []):
+            represented_ids.add(cid)
 
-    for item in classifications:
-        if item.get("type") != "MODULE":
+    recovery: list[dict] = []
+    for chunk in chunks:
+        chunk_id = chunk["chunk_id"]
+        if chunk_id in represented_ids:
+            continue
+        title = chunk.get("title_hint") or ""
+        local_headings = chunk.get("local_headings") or []
+        token_count = chunk.get("token_count") or 0
+
+        # Skip chunks with no meaningful title (they're intros or noise)
+        if not title or title == chunk_id:
             continue
 
-        heading = (item.get("heading") or "").strip()
-        if not heading or heading in seen_headings:
+        # A chunk is "substantive" if it has internal structure or enough text
+        is_substantive = len(local_headings) >= 2 or token_count >= 300
+        if not is_substantive:
             continue
-        seen_headings.add(heading)
 
-        # Use LLM-provided name; fall back to heuristic if blank or too long
-        name = (item.get("module_name") or "").strip()
-        if not name or len(name.split()) > 8:
-            name = _heading_to_module_name(heading)
+        # Create a recovery candidate using the exact heading text
+        rec_key = make_module_key(title)
+        # Avoid duplicate keys with existing candidates
+        existing_keys = {c.get("module_key", "") for c in candidates}
+        existing_keys.update(r.get("module_key", "") for r in recovery)
+        if rec_key in existing_keys:
+            continue
 
-        desc = (item.get("description") or "").strip() or f"Requirements for {name}"
-        level = level_by_heading.get(heading, 2)
-
-        # Unrecognised headings (not in cleaned list) go to end
-        doc_pos = position_index.get(heading, 10_000)
-
-        enriched.append({
-            "name":        name,
-            "heading":     heading,
-            "level":       level,
-            "description": desc,
-            "_doc_pos":    doc_pos,
+        recovery.append({
+            "module_key": rec_key,
+            "display_name": title,
+            "business_goal": "",
+            "primary_entities": [],
+            "main_actions": [],
+            "evidence_chunk_ids": [chunk_id],
+            "child_concepts": local_headings[:10],
+            "shared_artifacts": [],
+            "confidence": 0.65,  # lower than LLM output → normalizer may send to LLM review
         })
 
-    # Sort by original document position (critical for correct text slicing)
-    enriched.sort(key=lambda x: x["_doc_pos"])
-
-    modules: list[dict[str, Any]] = [
-        {k: v for k, v in m.items() if k != "_doc_pos"}
-        for m in enriched
-    ]
-
-    logger.info(
-        "segmentation_node: LLM classified %d candidate(s) → %d MODULE(s).",
-        heading_count, len(modules),
-    )
-
-    # ── Step 5: Fallback ──────────────────────────────────────────────────────
-    if not modules:
-        logger.warning(
-            "segmentation_node: no MODULE headings found; falling back to single module."
+    if recovery:
+        logger.info(
+            "module_inventory_node: recovery added %d candidate(s) for LLM-dropped chunks: %s",
+            len(recovery),
+            [r["module_key"] for r in recovery],
         )
-        modules = [{
-            "name": "Application",
-            "heading": "",
-            "level": 1,
-            "description": "Full document",
-        }]
+        candidates = candidates + recovery
 
     logger.info(
-        "segmentation_node: final module list (%d): %s",
-        len(modules), [m["name"] for m in modules],
+        "module_inventory_node: LLM returned %d module candidate(s) (+ %d recovery): %s",
+        len(candidates) - len(recovery),
+        len(recovery),
+        [c.get("module_key", "?") for c in candidates],
     )
-    return {"modules": modules, "all_usage": usages}
+    return {"module_candidates": candidates, "all_usage": usages}
+
+
+# ── Phase 1 (new): Module Normalizer ─────────────────────────────────────────
+
+async def module_normalizer_node(state: ExtractionState) -> dict[str, Any]:
+    """
+    Merge and normalize module candidates into canonical modules.
+
+    Step 1: Deterministic Python merge rules (absorb obvious child-like candidates).
+    Step 2: Optional single LLM call for remaining ambiguous candidates.
+
+    Replaces module_canonicalizer_node.
+
+    Reads:  state["module_candidates"], state["document_chunks"]
+    Writes: state["canonical_modules"], state["all_usage"]
+    """
+    from src.msbc.orchestration.utils.module_normalization import (
+        normalize_module_candidates,
+        merge_llm_normalized,
+    )
+    from src.msbc.agents.schemas.requirement_extractor.module_inventory import (
+        MODULE_NORMALIZATION_SCHEMA,
+    )
+
+    candidates: list[dict] = state.get("module_candidates") or []
+    chunks: list[dict] = state.get("document_chunks") or []
+    usages: list[dict] = []
+
+    if not candidates:
+        logger.warning("module_normalizer_node: no module_candidates; returning empty canonical_modules.")
+        return {"canonical_modules": [], "all_usage": []}
+
+    # Step 1: deterministic Python normalization
+    canonical, ambiguous = normalize_module_candidates(candidates, chunks)
+
+    logger.info(
+        "module_normalizer_node: after Python rules — %d canonical, %d ambiguous.",
+        len(canonical), len(ambiguous),
+    )
+
+    # Step 2: optional LLM call for ambiguous candidates
+    if ambiguous:
+        logger.info(
+            "module_normalizer_node: sending %d ambiguous candidate(s) to LLM for review.",
+            len(ambiguous),
+        )
+        try:
+            prompt = _load_prompt("module_normalization")
+            system_text = prompt["system"]
+            user_text = _fmt(
+                prompt["user_template"],
+                ambiguous_candidates_json=json.dumps(ambiguous, indent=2),
+                candidate_count=str(len(ambiguous)),
+            )
+
+            norm_result, norm_usages = await call_llm_with_schema(
+                system_prompt=system_text,
+                user_prompt=user_text,
+                schema=MODULE_NORMALIZATION_SCHEMA,
+                schema_name="module_normalization",
+            )
+
+            llm_modules: list[dict] = norm_result.get("canonical_modules") or []
+            usages.extend(norm_usages)
+
+            if llm_modules:
+                resolved = merge_llm_normalized(llm_modules, ambiguous)
+                canonical.extend(resolved)
+                logger.info(
+                    "module_normalizer_node: LLM resolved %d ambiguous candidate(s) → %d module(s).",
+                    len(ambiguous), len(resolved),
+                )
+        except Exception as exc:
+            logger.warning(
+                "module_normalizer_node: LLM normalization failed (%s); keeping Python-resolved modules only.",
+                exc,
+            )
+
+    logger.info(
+        "module_normalizer_node: final canonical modules (%d): %s",
+        len(canonical),
+        [m["module_key"] for m in canonical],
+    )
+    return {"canonical_modules": canonical, "all_usage": usages}
+
+
+# ── Phase 1 (new): Chunk Router ───────────────────────────────────────────────
+
+def chunk_router_node(state: ExtractionState) -> dict[str, Any]:
+    """
+    Route each DocumentChunk to one or more canonical modules (pure Python, no LLM).
+
+    Uses deterministic priority-order matching:
+      1. evidence_chunk_ids from module_inventory (resolves 80-90% of chunks)
+      2. title_hint fuzzy match against module display_name / aliases
+      3. local_headings overlap with module primary_entities / child_concepts
+
+    Reads:  state["document_chunks"], state["canonical_modules"]
+    Writes: state["chunk_routes"]
+    """
+    from src.msbc.orchestration.utils.chunk_routing import route_chunks
+
+    chunks: list[dict] = state.get("document_chunks") or []
+    canonical: list[dict] = state.get("canonical_modules") or []
+
+    if not chunks or not canonical:
+        logger.warning(
+            "chunk_router_node: missing chunks (%d) or canonical_modules (%d); returning empty routes.",
+            len(chunks), len(canonical),
+        )
+        return {"chunk_routes": []}
+
+    routes = route_chunks(chunks, canonical)
+
+    unassigned = [r for r in routes if r["route_type"] == "unassigned"]
+    if unassigned:
+        logger.warning(
+            "chunk_router_node: %d chunk(s) unassigned after deterministic routing: %s",
+            len(unassigned),
+            [r["chunk_id"] for r in unassigned],
+        )
+        # Build chunk position index for proximity fallback
+        chunk_pos: dict[str, int] = {c["chunk_id"]: i for i, c in enumerate(chunks)}
+        # Build module anchor positions (median position of each module's evidence chunks)
+        module_positions: dict[str, float] = {}
+        for cm in canonical:
+            ev_ids = cm.get("evidence_chunk_ids") or []
+            positions = [chunk_pos[cid] for cid in ev_ids if cid in chunk_pos]
+            if positions:
+                module_positions[cm["module_key"]] = sum(positions) / len(positions)
+
+        for route in unassigned:
+            cid = route["chunk_id"]
+            pos = chunk_pos.get(cid, 0)
+            # Assign to the module whose evidence chunks are closest in document position
+            if module_positions:
+                closest_key = min(module_positions, key=lambda mk: abs(module_positions[mk] - pos))
+            else:
+                closest_key = canonical[0]["module_key"] if canonical else ""
+            route["module_keys"] = [closest_key] if closest_key else []
+            route["route_type"] = "primary"
+            route["reason"] = "fallback: assigned to nearest canonical module by document position"
+            route["confidence"] = 0.3
+
+    logger.info(
+        "chunk_router_node: %d route(s) built for %d chunk(s).",
+        len(routes), len(chunks),
+    )
+    return {"chunk_routes": routes}
+
+
+# ── Phase 1.5: Module Bundle Builder ──────────────────────────────────────────
+
+def module_bundle_builder_node(state: ExtractionState) -> dict[str, Any]:
+    """
+    Assemble the text bundle for each canonical module from document chunks.
+
+    Reads document_chunks + chunk_routes (new Phase 1 flow) instead of the
+    old document_sections + classified_sections. For each CanonicalModule,
+    collects its routed chunks and concatenates their text with chunk headers.
+
+    Token budget enforcement (same rules as before):
+      - Total combined_text is capped at TOTAL_INPUT_TOKEN_LIMIT tokens.
+      - Over-budget modules drop lowest-priority chunks first.
+
+    Writes to state:
+      module_bundles — list of ModuleBundle dicts (one per canonical module).
+
+    Pure Python — no LLM, no network I/O.
+    """
+    logger.info("module_bundle_builder_node: building text bundles from document chunks.")
+
+    canonical_modules: list[dict] = state.get("canonical_modules") or []
+    document_chunks: list[dict] = state.get("document_chunks") or []
+    chunk_routes: list[dict] = state.get("chunk_routes") or []
+
+    if not canonical_modules:
+        logger.warning("module_bundle_builder_node: no canonical_modules; nothing to bundle.")
+        return {"module_bundles": []}
+
+    # Build lookups
+    chunk_by_id: dict[str, dict] = {c["chunk_id"]: c for c in document_chunks}
+
+    # Build reverse map: module_key → [chunk_id, ...] (in document order)
+    module_to_chunk_ids: dict[str, list[str]] = {cm["module_key"]: [] for cm in canonical_modules}
+    for route in chunk_routes:
+        for mk in (route.get("module_keys") or []):
+            if mk in module_to_chunk_ids:
+                cid = route["chunk_id"]
+                if cid not in module_to_chunk_ids[mk]:
+                    module_to_chunk_ids[mk].append(cid)
+
+    # Document order: use position of chunk_id in document_chunks list
+    chunk_order: dict[str, int] = {c["chunk_id"]: i for i, c in enumerate(document_chunks)}
+
+    MODULE_TEXT_BUDGET = max(TOTAL_INPUT_TOKEN_LIMIT - PROMPT_MAX_TOKENS, 2000)
+
+    module_bundles: list[dict[str, Any]] = []
+
+    for cm in canonical_modules:
+        module_key: str = cm["module_key"]
+        display_name: str = cm["display_name"]
+        business_goal: str = cm.get("business_goal", "")
+        child_concepts: list[str] = cm.get("child_concepts") or []
+
+        # Get chunk_ids in document order
+        raw_chunk_ids = module_to_chunk_ids.get(module_key) or []
+
+        # Fallback: if routing produced nothing, use evidence_chunk_ids from the module itself
+        if not raw_chunk_ids:
+            raw_chunk_ids = list(cm.get("evidence_chunk_ids") or [])
+            logger.info(
+                "module_bundle_builder_node: '%s' had no routes — falling back to evidence_chunk_ids: %s",
+                module_key, raw_chunk_ids,
+            )
+
+        # Sort by document order
+        sorted_chunk_ids = sorted(raw_chunk_ids, key=lambda cid: chunk_order.get(cid, 9999))
+
+        # Build parts list
+        parts: list[dict[str, Any]] = []
+        for cid in sorted_chunk_ids:
+            chunk = chunk_by_id.get(cid)
+            if not chunk:
+                continue
+            text = chunk.get("text", "")
+            if not text.strip():
+                continue
+            parts.append({
+                "chunk_id": cid,
+                "title": chunk.get("title_hint") or cid,
+                "text": text,
+                "tokens": chunk.get("token_count") or count_tokens(text),
+            })
+
+        if not parts:
+            logger.warning(
+                "module_bundle_builder_node: no text chunks for module %r; skipping.",
+                module_key,
+            )
+            continue
+
+        total_tokens = sum(p["tokens"] for p in parts)
+
+        # Apply truncation if over budget (drop last chunks first — they're usually
+        # shared/lower-priority content)
+        if total_tokens > MODULE_TEXT_BUDGET:
+            kept_parts: list[dict] = []
+            used = 0
+            for part in parts:
+                if used + part["tokens"] <= MODULE_TEXT_BUDGET:
+                    kept_parts.append(part)
+                    used += part["tokens"]
+                else:
+                    logger.info(
+                        "module_bundle_builder_node: '%s' — dropping chunk %r (%d tokens) over budget.",
+                        module_key, part["chunk_id"], part["tokens"],
+                    )
+            logger.info(
+                "module_bundle_builder_node: '%s' trimmed %d → %d chunk(s) (%d → %d tokens).",
+                module_key, len(parts), len(kept_parts), total_tokens, used,
+            )
+            parts = kept_parts
+
+        # Build combined text
+        header_lines: list[str] = [f"# Canonical Module: {display_name}"]
+        if business_goal:
+            header_lines.append(f"\nBusiness Goal:\n{business_goal}")
+        if child_concepts:
+            concepts_str = "\n".join(f"- {c}" for c in child_concepts)
+            header_lines.append(f"\nIncluded Child Concepts:\n{concepts_str}")
+        included_chunk_ids = [p["chunk_id"] for p in parts]
+        chunks_str = "\n".join(f"- {cid}" for cid in included_chunk_ids)
+        header_lines.append(f"\nSource Chunks:\n{chunks_str}")
+        header_lines.append("\n## Source Content")
+
+        chunk_blocks: list[str] = ["\n".join(header_lines)]
+        for part in parts:
+            block_header = f"\n### Chunk: {part['title']} ({part['chunk_id']})\n\n"
+            chunk_blocks.append(block_header + part["text"])
+
+        combined_text = "\n".join(chunk_blocks)
+
+        bundle: dict[str, Any] = {
+            "module_key": module_key,
+            "display_name": display_name,
+            "combined_text": combined_text,
+            "source_chunk_ids": included_chunk_ids,
+        }
+        module_bundles.append(bundle)
+
+    logger.info(
+        "module_bundle_builder_node: built %d bundle(s) for canonical modules.",
+        len(module_bundles),
+    )
+    return {"module_bundles": module_bundles}
 
 
 # ── Phase 0.5: Build slices (fan-out prep) ────────────────────────────────────
@@ -651,10 +791,12 @@ def build_slices_node(state: ExtractionState) -> list["Send"]:  # type: ignore[n
         module_text = _slice_module_text(document_text, heading, next_heading)
 
         slice_input: ModuleSlice = {
-            "index":       idx,
-            "module_name": module_meta["name"],
-            "module_text": module_text,
-            "mode":        mode,
+            "index":              idx,
+            "module_name":        module_meta["name"],
+            "module_text":        module_text,
+            "mode":               mode,
+            "module_key":         None,
+            "source_chunk_ids": [],
         }
         sends.append(Send("extract_module_node", slice_input))
 
@@ -1091,9 +1233,11 @@ async def _extract_module_body(slice_input: ModuleSlice) -> dict[str, Any]:
     Called exclusively through extract_module_node which applies the module-level
     concurrency semaphore (MODULE_BATCH_SIZE) before delegating here.
     """
-    module_name = slice_input["module_name"]
-    module_text = slice_input["module_text"]
-    mode        = slice_input["mode"]
+    module_name         = slice_input["module_name"]
+    module_text         = slice_input["module_text"]
+    mode                = slice_input["mode"]
+    module_key          = slice_input.get("module_key") or ""
+    source_chunk_ids  = slice_input.get("source_chunk_ids") or []
 
     # Cap raised to 20 (from 10) so large modules (ERP user stories) lose fewer
     # requirements. Each chunk still fits within the token budget.
@@ -1379,10 +1523,12 @@ async def _extract_module_body(slice_input: ModuleSlice) -> dict[str, Any]:
         )
 
     module_result: ModuleResult = {
-        "module_name": module_name,
-        "extraction":  extraction_result,
-        "summary":     summary_result,
-        "usage":       all_usages,
+        "module_name":        module_name,
+        "extraction":         extraction_result,
+        "summary":            summary_result,
+        "usage":              all_usages,
+        "module_key":         module_key,
+        "source_chunk_ids": source_chunk_ids,
     }
     # Append to the state's results list via the Annotated reducer
     return {"results": [module_result]}
@@ -1419,26 +1565,877 @@ def _screen_count(result: dict[str, Any], mode: str) -> int:
     return len((result.get("module") or {}).get("screens", []))
 
 
-# ── Phase 2: Finalize (pure-Python collect + graph builder LLM) ──────────────
+# ── Phase 2: Artifact Index Node ─────────────────────────────────────────────
+
+def artifact_index_node(state: ExtractionState) -> dict[str, Any]:
+    """
+    Phase 2: Build a flat catalog of normalized artifact signatures across all modules.
+
+    Runs ONCE after all parallel extract_module_node tasks complete.
+    The fan-in is automatic: the Annotated[list, operator.add] reducer on
+    state["results"] accumulates every result before this node runs.
+
+    Reads:
+      state["results"] — fully accumulated list of ModuleResult dicts.
+      state["mode"]    — extraction mode (frontend | backend | both).
+
+    Writes to state:
+      artifact_index — dict mapping artifact type → list of ArtifactSignature dicts.
+    """
+    from src.msbc.orchestration.utils.artifact_index import build_artifact_index
+
+    results: list[ModuleResult] = state.get("results") or []
+    mode:    str                = state.get("mode") or "both"
+
+    if not results:
+        logger.warning("artifact_index_node: no results in state; skipping.")
+        return {"artifact_index": {}}
+
+    logger.info(
+        "artifact_index_node: building artifact index from %d module result(s).",
+        len(results),
+    )
+    try:
+        artifact_index = build_artifact_index(list(results), mode)
+    except Exception as exc:
+        logger.error(
+            "artifact_index_node: failed to build artifact index: %s. "
+            "Continuing with empty index.",
+            exc,
+        )
+        artifact_index = {}
+
+    return {"artifact_index": artifact_index}
+
+
+# ── Phase 2: Artifact Deduplication Node ──────────────────────────────────────
+
+def artifact_deduplication_node(state: ExtractionState) -> dict[str, Any]:
+    """
+    Phase 2: Deduplicate artifacts across canonical modules and flag conflicts.
+
+    Reads state["artifact_index"] (built by artifact_index_node) and:
+      1. Merges compatible duplicates (same API path+method, same DB model name,
+         same enum name with compatible values, semantically equivalent business rules).
+      2. Flags incompatible duplicates as conflicts with needs_review=True.
+      3. Produces a full audit trail in dedupe_report.
+
+    Self-edge removal from the dependency graph is handled in finalize_node
+    (the graph is not yet built when this node runs) and appended to dedupe_report.
+
+    Reads:
+      state["artifact_index"] — output of artifact_index_node.
+
+    Writes to state:
+      artifact_index — cleaned (deduplicated) artifact index.
+      dedupe_report  — merge decisions, conflicts, placeholder for self-edges.
+    """
+    from src.msbc.orchestration.utils.deduplication import run_deduplication
+
+    artifact_index: dict[str, Any] = state.get("artifact_index") or {}
+
+    if not artifact_index:
+        logger.warning(
+            "artifact_deduplication_node: empty artifact_index; skipping deduplication."
+        )
+        empty_report: dict[str, Any] = {
+            "merged_artifacts":  [],
+            "conflicts":         [],
+            "self_edges_removed": [],
+            "summary": {
+                "total_artifacts_before":  0,
+                "total_artifacts_after":   0,
+                "duplicate_groups_merged": 0,
+                "conflicts_flagged":       0,
+                "self_edges_removed":      0,
+            },
+        }
+        return {"artifact_index": {}, "dedupe_report": empty_report}
+
+    logger.info("artifact_deduplication_node: running deduplication pass.")
+    try:
+        cleaned_index, dedupe_report = run_deduplication(artifact_index)
+    except Exception as exc:
+        logger.error(
+            "artifact_deduplication_node: deduplication failed: %s. "
+            "Continuing with unmodified artifact_index.",
+            exc,
+        )
+        total = sum(len(v) for v in artifact_index.values())
+        cleaned_index = artifact_index
+        dedupe_report = {
+            "merged_artifacts":  [],
+            "conflicts":         [],
+            "self_edges_removed": [],
+            "summary": {
+                "total_artifacts_before":  total,
+                "total_artifacts_after":   total,
+                "duplicate_groups_merged": 0,
+                "conflicts_flagged":       0,
+                "self_edges_removed":      0,
+            },
+        }
+
+    return {"artifact_index": cleaned_index, "dedupe_report": dedupe_report}
+
+
+# ── Phase 3: Requirement Linter Node ──────────────────────────────────────────
+
+def _deprecated_requirement_linter_node_copy(state: ExtractionState) -> dict[str, Any]:
+    """
+    Phase 3: Deterministic quality gate — no LLM, never blocks the pipeline.
+
+    Runs 12 checks across the fully assembled extraction output and produces a
+    quality_report dict that is merged into state["extraction"]. On any internal
+    error the node logs and returns a degraded-but-valid report rather than
+    raising, so downstream response assembly is never interrupted.
+
+    Checks performed (all deterministic Python):
+      CHILD_SECTION_EXTRACTED_AS_MODULE — a primary section is not BUSINESS_MODULE type
+      DUPLICATE_MODULE_NAME             — two canonical modules share the same key
+      DUPLICATE_API_INTENT              — same (method, path) post-dedup across modules
+      SAME_API_DIFFERENT_SCHEMA         — same path but conflicting schemas (from dedupe)
+      DUPLICATE_DB_MODEL                — same table_name post-dedup across modules
+      SAME_ENUM_DIFFERENT_VALUES        — enum conflict still unresolved (from dedupe)
+      SELF_GRAPH_EDGE                   — a module's graph edge points to itself
+      ORPHAN_GRAPH_NODE                 — graph node with zero edges
+      EMPTY_FILTER_PANEL                — filter_panel component with no filter fields
+      EMPTY_GRID_COLUMNS                — grid component with no columns defined
+      FORM_WITHOUT_SUBMIT_ACTION        — form component with no save/submit action
+      MISSING_SOURCE_SECTION            — module result has no source_chunk_ids
+
+    Reads:
+      state["extraction"]         — assembled modules list with components
+      state["graph"]              — dependency graph nodes + edges
+      state["artifact_index"]     — cleaned ArtifactSignature catalog (Phase 2)
+      state["dedupe_report"]      — Phase 2 deduplication audit trail
+      state["canonical_modules"]  — CanonicalModule dicts (Phase 1)
+      state["canonical_modules"]  — used for module key checks
+      state["results"]            — per-module extraction results
+
+    Writes to state:
+      extraction     — extraction dict with "quality_report" key added.
+      quality_report — same report also stored as a standalone state key.
+    """
+    import re as _re
+
+    issues:  list[dict[str, Any]] = []
+
+    def _issue(check: str, description: str, **extra: Any) -> None:
+        entry: dict[str, Any] = {"check": check, "description": description}
+        entry.update({k: v for k, v in extra.items() if v is not None})
+        issues.append(entry)
+        logger.info("requirement_linter_node [%s]: %s", check, description)
+
+    try:
+        extraction         = state.get("extraction")         or {}
+        graph_data         = state.get("graph")              or {}
+        artifact_index     = state.get("artifact_index")     or {}
+        dedupe_report      = state.get("dedupe_report")      or {}
+        canonical_modules  = state.get("canonical_modules")  or []
+        module_candidates  = state.get("module_candidates")  or []
+        results            = state.get("results")            or []
+
+        # classified_by_id removed: section-type lookup no longer applicable
+        # (section_classifier_node removed in Phase 1 chunk-based flow)
+        classified_by_id: dict[str, str] = {}
+
+        # ── 1. CHILD_SECTION_EXTRACTED_AS_MODULE ──────────────────────────────
+        # A canonical module's primary_section_id is classified as a child type.
+        child_types = {
+            "SCREEN", "FORM", "GRID", "TOOLBAR", "FILTER_PANEL",
+            "WORKFLOW", "VALIDATION_RULES", "BUSINESS_RULES",
+            "ENUM_DEFINITION", "API_SPEC", "MODEL_SPEC",
+            "INTEGRATION", "EXAMPLE", "NOTE", "UNKNOWN",
+        }
+        for cm in canonical_modules:
+            primary_id  = cm.get("primary_section_id", "")
+            sec_type    = classified_by_id.get(primary_id, "")
+            module_key  = cm.get("module_key", "")
+            if sec_type and sec_type in child_types:
+                _issue(
+                    "CHILD_SECTION_EXTRACTED_AS_MODULE",
+                    f"Module '{module_key}' primary section {primary_id!r} "
+                    f"has type '{sec_type}', not BUSINESS_MODULE.",
+                    module_key=module_key,
+                    section_id=primary_id,
+                    section_type=sec_type,
+                )
+
+        # ── 2. DUPLICATE_MODULE_NAME ──────────────────────────────────────────
+        seen_keys: dict[str, str] = {}
+        for cm in canonical_modules:
+            key = cm.get("module_key", "")
+            if not key:
+                continue
+            if key in seen_keys:
+                _issue(
+                    "DUPLICATE_MODULE_NAME",
+                    f"Canonical module key '{key}' appears more than once.",
+                    module_key=key,
+                )
+            else:
+                seen_keys[key] = key
+
+        # ── 3. DUPLICATE_API_INTENT (post-dedup) ─────────────────────────────
+        # Same (method, path) still present in multiple modules after Phase 2.
+        api_sigs: list[dict[str, Any]] = artifact_index.get("api_endpoints", [])
+        api_by_key: dict[tuple[str, str], list[str]] = {}
+        for sig in api_sigs:
+            ep_key = (
+                (sig.get("method") or "").upper(),
+                sig.get("path") or "/",
+            )
+            api_by_key.setdefault(ep_key, []).append(sig.get("module_key", ""))
+        for (method, path), module_keys in api_by_key.items():
+            unique_modules = list(dict.fromkeys(module_keys))
+            if len(unique_modules) > 1:
+                _issue(
+                    "DUPLICATE_API_INTENT",
+                    f"{method} {path} still present in multiple modules after dedup: "
+                    + ", ".join(unique_modules),
+                    endpoint=f"{method} {path}",
+                    module_keys=unique_modules,
+                )
+
+        # ── 4. SAME_API_DIFFERENT_SCHEMA (from dedupe conflicts) ──────────────
+        for conflict in dedupe_report.get("conflicts", []):
+            if conflict.get("artifact_type") == "api_endpoint":
+                _issue(
+                    "SAME_API_DIFFERENT_SCHEMA",
+                    f"API endpoint conflict not resolved: {conflict.get('reason', '')}",
+                    canonical_id=conflict.get("canonical_id"),
+                    conflicting_ids=conflict.get("conflicting_ids"),
+                    needs_review=conflict.get("needs_review", True),
+                )
+
+        # ── 5. DUPLICATE_DB_MODEL (post-dedup) ───────────────────────────────
+        model_sigs: list[dict[str, Any]] = artifact_index.get("db_models", [])
+        model_by_table: dict[str, list[str]] = {}
+        for sig in model_sigs:
+            table = sig.get("table_name") or sig.get("normalized_name") or ""
+            model_by_table.setdefault(table, []).append(sig.get("module_key", ""))
+        for table, module_keys in model_by_table.items():
+            unique_modules = list(dict.fromkeys(module_keys))
+            if len(unique_modules) > 1:
+                _issue(
+                    "DUPLICATE_DB_MODEL",
+                    f"DB model '{table}' still present in multiple modules after dedup: "
+                    + ", ".join(unique_modules),
+                    table_name=table,
+                    module_keys=unique_modules,
+                )
+
+        # ── 6. SAME_ENUM_DIFFERENT_VALUES (unresolved enum conflicts) ─────────
+        for conflict in dedupe_report.get("conflicts", []):
+            if conflict.get("artifact_type") == "enum":
+                _issue(
+                    "SAME_ENUM_DIFFERENT_VALUES",
+                    f"Enum conflict not resolved: {conflict.get('reason', '')}",
+                    canonical_id=conflict.get("canonical_id"),
+                    recommended_canonical=conflict.get("recommended_canonical"),
+                    needs_review=conflict.get("needs_review", True),
+                )
+
+        # ── 7. SELF_GRAPH_EDGE ────────────────────────────────────────────────
+        graph_edges: list[dict[str, Any]] = graph_data.get("edges", [])
+        for edge in graph_edges:
+            if edge.get("from") and edge.get("from") == edge.get("to"):
+                _issue(
+                    "SELF_GRAPH_EDGE",
+                    f"Graph edge '{edge['from']}' → '{edge['to']}' is a self-reference.",
+                    module_key=edge.get("from"),
+                )
+
+        # ── 8. ORPHAN_GRAPH_NODE ──────────────────────────────────────────────
+        graph_nodes: list[dict[str, Any]] = graph_data.get("nodes", [])
+        node_ids_with_edges: set[str] = set()
+        for edge in graph_edges:
+            node_ids_with_edges.add(edge.get("from", ""))
+            node_ids_with_edges.add(edge.get("to",   ""))
+        for node in graph_nodes:
+            nid = node.get("id", "")
+            if nid and nid not in node_ids_with_edges:
+                _issue(
+                    "ORPHAN_GRAPH_NODE",
+                    f"Graph node '{nid}' has no edges (no dependencies defined).",
+                    module_key=nid,
+                )
+
+        # ── 9–11. Component-level checks (EMPTY_FILTER_PANEL, EMPTY_GRID_COLUMNS,
+        #          FORM_WITHOUT_SUBMIT_ACTION) ──────────────────────────────────
+        def _check_screen_components(
+            screen: dict[str, Any],
+            module_key: str,
+        ) -> None:
+            """Walk a screen's components list and run component-level lint checks."""
+            for comp in screen.get("components", []):
+                if not isinstance(comp, dict):
+                    continue
+                ctype = comp.get("type", "")
+                cname = comp.get("id") or comp.get("name") or ctype
+
+                # 9. EMPTY_FILTER_PANEL
+                if ctype == "filter_panel":
+                    fields = comp.get("fields") or comp.get("filters") or []
+                    if not fields:
+                        _issue(
+                            "EMPTY_FILTER_PANEL",
+                            f"Screen '{screen.get('name', '?')}' has a filter_panel "
+                            f"'{cname}' with no filter fields defined.",
+                            module_key=module_key,
+                            screen=screen.get("name"),
+                            component=cname,
+                        )
+
+                # 10. EMPTY_GRID_COLUMNS
+                elif ctype == "grid":
+                    columns = comp.get("columns") or comp.get("fields") or []
+                    if not columns:
+                        _issue(
+                            "EMPTY_GRID_COLUMNS",
+                            f"Screen '{screen.get('name', '?')}' has a grid "
+                            f"'{cname}' with no columns defined.",
+                            module_key=module_key,
+                            screen=screen.get("name"),
+                            component=cname,
+                        )
+
+                # 11. FORM_WITHOUT_SUBMIT_ACTION
+                elif ctype == "form":
+                    actions = comp.get("actions") or []
+                    submit_keywords = {"save", "submit", "create", "update",
+                                       "add", "confirm", "apply", "ok"}
+                    has_submit = any(
+                        any(kw in str(a.get("label", "")).lower()
+                            or kw in str(a.get("action", "")).lower()
+                            for kw in submit_keywords)
+                        for a in actions
+                        if isinstance(a, dict)
+                    )
+                    if not has_submit and not actions:
+                        _issue(
+                            "FORM_WITHOUT_SUBMIT_ACTION",
+                            f"Screen '{screen.get('name', '?')}' has a form "
+                            f"'{cname}' with no save/submit action defined.",
+                            module_key=module_key,
+                            screen=screen.get("name"),
+                            component=cname,
+                        )
+
+                # Recurse into tabs children
+                if ctype == "tabs":
+                    for tab in comp.get("children", []):
+                        _check_screen_components(
+                            {"name": screen.get("name"), "components": tab.get("components", [])},
+                            module_key,
+                        )
+
+        mode = state.get("mode") or "both"
+        for mod in extraction.get("modules", []):
+            mk = mod.get("module_key") or mod.get("name") or ""
+            if mode == "both":
+                screens = mod.get("frontend", {}).get("screens", [])
+            else:
+                screens = mod.get("screens", [])
+            for screen in (screens or []):
+                if isinstance(screen, dict):
+                    _check_screen_components(screen, mk)
+
+        # ── 12. MISSING_SOURCE_SECTION ────────────────────────────────────────
+        for res in results:
+            mk  = res.get("module_key") or res.get("module_name") or "?"
+            sids = res.get("source_chunk_ids") or []
+            if not sids:
+                _issue(
+                    "MISSING_SOURCE_SECTION",
+                    f"Module '{mk}' has no source_chunk_ids — "
+                    f"cannot trace artifacts back to document sections.",
+                    module_key=mk,
+                )
+
+    except Exception as exc:
+        logger.error(
+            "requirement_linter_node: unexpected error during lint checks: %s. "
+            "Quality report will be partial.",
+            exc,
+        )
+        issues.append({
+            "check":       "LINTER_INTERNAL_ERROR",
+            "description": f"Linter crashed: {exc}",
+        })
+
+    # ── Build metrics ─────────────────────────────────────────────────────────
+    dedupe_summary = dedupe_report.get("summary") or {}
+    metrics: dict[str, Any] = {
+        "module_count_before_canonicalization": len(module_candidates),
+        "module_count_after_canonicalization":  len(canonical_modules),
+        "duplicate_module_clusters_merged":     dedupe_summary.get("duplicate_groups_merged", 0),
+        "duplicate_api_groups_found": sum(
+            1 for i in issues if i.get("check") == "DUPLICATE_API_INTENT"
+        ),
+        "enum_conflicts":      dedupe_summary.get("conflicts_flagged", 0),
+        "self_graph_edges_removed": dedupe_summary.get("self_edges_removed", 0),
+    }
+
+    # Check codes that are not warnings — presence means passed=False
+    blocking_checks = {
+        "DUPLICATE_MODULE_NAME",
+        "DUPLICATE_API_INTENT",
+        "DUPLICATE_DB_MODEL",
+        "SAME_ENUM_DIFFERENT_VALUES",
+        "SELF_GRAPH_EDGE",
+        "LINTER_INTERNAL_ERROR",
+    }
+    passed = not any(i.get("check") in blocking_checks for i in issues)
+
+    quality_report: dict[str, Any] = {
+        "passed":  passed,
+        "metrics": metrics,
+        "issues":  issues,
+    }
+
+    logger.info(
+        "requirement_linter_node: %s — %d issue(s) found. "
+        "(modules %d→%d, %d merge(s), %d conflict(s), %d self-edge(s) removed)",
+        "PASSED" if passed else "FAILED",
+        len(issues),
+        metrics["module_count_before_canonicalization"],
+        metrics["module_count_after_canonicalization"],
+        metrics["duplicate_module_clusters_merged"],
+        metrics["enum_conflicts"],
+        metrics["self_graph_edges_removed"],
+    )
+
+    # Merge quality_report into the extraction dict that finalize_node produced.
+    updated_extraction = dict(state.get("extraction") or {})
+    updated_extraction["quality_report"] = quality_report
+
+    return {
+        "extraction":    updated_extraction,
+        "quality_report": quality_report,
+    }
+
+
+# ── Phase 3: Quality Gate Node ────────────────────────────────────────────────
+
+def quality_gate_node(state: ExtractionState) -> dict[str, Any]:
+    """
+    Phase 3: Deterministic quality gate — no LLM, never blocks the pipeline.
+
+    Runs 14 checks across the fully assembled extraction output and produces a
+    quality_report dict that is merged into state["extraction"]. On any internal
+    error the node logs and returns a degraded-but-valid report rather than
+    raising, so downstream response assembly is never interrupted.
+
+    Checks performed (all deterministic Python):
+      CHILD_SECTION_EXTRACTED_AS_MODULE — a primary section is not BUSINESS_MODULE type
+      DUPLICATE_MODULE_NAME             — two canonical modules share the same key
+      DUPLICATE_API_INTENT              — same (method, path) post-dedup across modules
+      SAME_API_DIFFERENT_SCHEMA         — same path but conflicting schemas (from dedupe)
+      DUPLICATE_DB_MODEL                — same table_name post-dedup across modules
+      SAME_ENUM_DIFFERENT_VALUES        — enum conflict still unresolved (from dedupe)
+      SELF_GRAPH_EDGE                   — a module's graph edge points to itself
+      ORPHAN_GRAPH_NODE                 — graph node with zero edges
+      EMPTY_FILTER_PANEL                — filter_panel component with no filter fields
+      EMPTY_GRID_COLUMNS                — grid component with no columns defined
+      FORM_WITHOUT_SUBMIT_ACTION        — form component with no save/submit action
+      MISSING_SOURCE_SECTION            — module result has no source_chunk_ids
+      MODULE_COUNT_WARNING              — canonical module count exceeds expected range
+      SUSPICIOUS_MODULE_NAME            — module key contains child-concept patterns
+
+    Reads:
+      state["extraction"]         — assembled modules list with components
+      state["graph"]              — dependency graph nodes + edges
+      state["artifact_index"]     — cleaned ArtifactSignature catalog (Phase 2)
+      state["dedupe_report"]      — Phase 2 deduplication audit trail
+      state["canonical_modules"]  — CanonicalModule dicts (Phase 1)
+      state["canonical_modules"]  — used for module key checks
+      state["results"]            — per-module extraction results
+
+    Writes to state:
+      extraction     — extraction dict with "quality_report" key added.
+      quality_report — same report also stored as a standalone state key.
+    """
+    import re as _re
+
+    issues:  list[dict[str, Any]] = []
+
+    def _issue(check: str, description: str, **extra: Any) -> None:
+        entry: dict[str, Any] = {"check": check, "description": description}
+        entry.update({k: v for k, v in extra.items() if v is not None})
+        issues.append(entry)
+        logger.info("quality_gate_node [%s]: %s", check, description)
+
+    try:
+        extraction         = state.get("extraction")         or {}
+        graph_data         = state.get("graph")              or {}
+        artifact_index     = state.get("artifact_index")     or {}
+        dedupe_report      = state.get("dedupe_report")      or {}
+        canonical_modules  = state.get("canonical_modules")  or []
+        module_candidates  = state.get("module_candidates")  or []
+        results            = state.get("results")            or []
+
+        # classified_by_id removed: section-type lookup no longer applicable
+        # (section_classifier_node removed in Phase 1 chunk-based flow)
+        classified_by_id: dict[str, str] = {}
+
+        # ── 1. CHILD_SECTION_EXTRACTED_AS_MODULE ──────────────────────────────
+        # A canonical module's primary_section_id is classified as a child type.
+        child_types = {
+            "SCREEN", "FORM", "GRID", "TOOLBAR", "FILTER_PANEL",
+            "WORKFLOW", "VALIDATION_RULES", "BUSINESS_RULES",
+            "ENUM_DEFINITION", "API_SPEC", "MODEL_SPEC",
+            "INTEGRATION", "EXAMPLE", "NOTE", "UNKNOWN",
+        }
+        for cm in canonical_modules:
+            primary_id  = cm.get("primary_section_id", "")
+            sec_type    = classified_by_id.get(primary_id, "")
+            module_key  = cm.get("module_key", "")
+            if sec_type and sec_type in child_types:
+                _issue(
+                    "CHILD_SECTION_EXTRACTED_AS_MODULE",
+                    f"Module '{module_key}' primary section {primary_id!r} "
+                    f"has type '{sec_type}', not BUSINESS_MODULE.",
+                    module_key=module_key,
+                    section_id=primary_id,
+                    section_type=sec_type,
+                )
+
+        # ── 2. DUPLICATE_MODULE_NAME ──────────────────────────────────────────
+        seen_keys: dict[str, str] = {}
+        for cm in canonical_modules:
+            key = cm.get("module_key", "")
+            if not key:
+                continue
+            if key in seen_keys:
+                _issue(
+                    "DUPLICATE_MODULE_NAME",
+                    f"Canonical module key '{key}' appears more than once.",
+                    module_key=key,
+                )
+            else:
+                seen_keys[key] = key
+
+        # ── 3. DUPLICATE_API_INTENT (post-dedup) ─────────────────────────────
+        # Same (method, path) still present in multiple modules after Phase 2.
+        api_sigs: list[dict[str, Any]] = artifact_index.get("api_endpoints", [])
+        api_by_key: dict[tuple[str, str], list[str]] = {}
+        for sig in api_sigs:
+            ep_key = (
+                (sig.get("method") or "").upper(),
+                sig.get("path") or "/",
+            )
+            api_by_key.setdefault(ep_key, []).append(sig.get("module_key", ""))
+        for (method, path), module_keys in api_by_key.items():
+            unique_modules = list(dict.fromkeys(module_keys))
+            if len(unique_modules) > 1:
+                _issue(
+                    "DUPLICATE_API_INTENT",
+                    f"{method} {path} still present in multiple modules after dedup: "
+                    + ", ".join(unique_modules),
+                    endpoint=f"{method} {path}",
+                    module_keys=unique_modules,
+                )
+
+        # ── 4. SAME_API_DIFFERENT_SCHEMA (from dedupe conflicts) ──────────────
+        for conflict in dedupe_report.get("conflicts", []):
+            if conflict.get("artifact_type") == "api_endpoint":
+                _issue(
+                    "SAME_API_DIFFERENT_SCHEMA",
+                    f"API endpoint conflict not resolved: {conflict.get('reason', '')}",
+                    canonical_id=conflict.get("canonical_id"),
+                    conflicting_ids=conflict.get("conflicting_ids"),
+                    needs_review=conflict.get("needs_review", True),
+                )
+
+        # ── 5. DUPLICATE_DB_MODEL (post-dedup) ───────────────────────────────
+        model_sigs: list[dict[str, Any]] = artifact_index.get("db_models", [])
+        model_by_table: dict[str, list[str]] = {}
+        for sig in model_sigs:
+            table = sig.get("table_name") or sig.get("normalized_name") or ""
+            model_by_table.setdefault(table, []).append(sig.get("module_key", ""))
+        for table, module_keys in model_by_table.items():
+            unique_modules = list(dict.fromkeys(module_keys))
+            if len(unique_modules) > 1:
+                _issue(
+                    "DUPLICATE_DB_MODEL",
+                    f"DB model '{table}' still present in multiple modules after dedup: "
+                    + ", ".join(unique_modules),
+                    table_name=table,
+                    module_keys=unique_modules,
+                )
+
+        # ── 6. SAME_ENUM_DIFFERENT_VALUES (unresolved enum conflicts) ─────────
+        for conflict in dedupe_report.get("conflicts", []):
+            if conflict.get("artifact_type") == "enum":
+                _issue(
+                    "SAME_ENUM_DIFFERENT_VALUES",
+                    f"Enum conflict not resolved: {conflict.get('reason', '')}",
+                    canonical_id=conflict.get("canonical_id"),
+                    recommended_canonical=conflict.get("recommended_canonical"),
+                    needs_review=conflict.get("needs_review", True),
+                )
+
+        # ── 7. SELF_GRAPH_EDGE ────────────────────────────────────────────────
+        graph_edges: list[dict[str, Any]] = graph_data.get("edges", [])
+        for edge in graph_edges:
+            if edge.get("from") and edge.get("from") == edge.get("to"):
+                _issue(
+                    "SELF_GRAPH_EDGE",
+                    f"Graph edge '{edge['from']}' → '{edge['to']}' is a self-reference.",
+                    module_key=edge.get("from"),
+                )
+
+        # ── 8. ORPHAN_GRAPH_NODE ──────────────────────────────────────────────
+        graph_nodes: list[dict[str, Any]] = graph_data.get("nodes", [])
+        node_ids_with_edges: set[str] = set()
+        for edge in graph_edges:
+            node_ids_with_edges.add(edge.get("from", ""))
+            node_ids_with_edges.add(edge.get("to",   ""))
+        for node in graph_nodes:
+            nid = node.get("id", "")
+            if nid and nid not in node_ids_with_edges:
+                _issue(
+                    "ORPHAN_GRAPH_NODE",
+                    f"Graph node '{nid}' has no edges (no dependencies defined).",
+                    module_key=nid,
+                )
+
+        # ── 9–11. Component-level checks (EMPTY_FILTER_PANEL, EMPTY_GRID_COLUMNS,
+        #          FORM_WITHOUT_SUBMIT_ACTION) ──────────────────────────────────
+        def _check_screen_components(
+            screen: dict[str, Any],
+            module_key: str,
+        ) -> None:
+            """Walk a screen's components list and run component-level lint checks."""
+            for comp in screen.get("components", []):
+                if not isinstance(comp, dict):
+                    continue
+                ctype = comp.get("type", "")
+                cname = comp.get("id") or comp.get("name") or ctype
+
+                # 9. EMPTY_FILTER_PANEL
+                if ctype == "filter_panel":
+                    fields = comp.get("fields") or comp.get("filters") or []
+                    if not fields:
+                        _issue(
+                            "EMPTY_FILTER_PANEL",
+                            f"Screen '{screen.get('name', '?')}' has a filter_panel "
+                            f"'{cname}' with no filter fields defined.",
+                            module_key=module_key,
+                            screen=screen.get("name"),
+                            component=cname,
+                        )
+
+                # 10. EMPTY_GRID_COLUMNS
+                elif ctype == "grid":
+                    columns = comp.get("columns") or comp.get("fields") or []
+                    if not columns:
+                        _issue(
+                            "EMPTY_GRID_COLUMNS",
+                            f"Screen '{screen.get('name', '?')}' has a grid "
+                            f"'{cname}' with no columns defined.",
+                            module_key=module_key,
+                            screen=screen.get("name"),
+                            component=cname,
+                        )
+
+                # 11. FORM_WITHOUT_SUBMIT_ACTION
+                elif ctype == "form":
+                    actions = comp.get("actions") or []
+                    submit_keywords = {"save", "submit", "create", "update",
+                                       "add", "confirm", "apply", "ok"}
+                    has_submit = any(
+                        any(kw in str(a.get("label", "")).lower()
+                            or kw in str(a.get("action", "")).lower()
+                            for kw in submit_keywords)
+                        for a in actions
+                        if isinstance(a, dict)
+                    )
+                    if not has_submit and not actions:
+                        _issue(
+                            "FORM_WITHOUT_SUBMIT_ACTION",
+                            f"Screen '{screen.get('name', '?')}' has a form "
+                            f"'{cname}' with no save/submit action defined.",
+                            module_key=module_key,
+                            screen=screen.get("name"),
+                            component=cname,
+                        )
+
+                # Recurse into tabs children
+                if ctype == "tabs":
+                    for tab in comp.get("children", []):
+                        _check_screen_components(
+                            {"name": screen.get("name"), "components": tab.get("components", [])},
+                            module_key,
+                        )
+
+        mode = state.get("mode") or "both"
+        for mod in extraction.get("modules", []):
+            mk = mod.get("module_key") or mod.get("name") or ""
+            if mode == "both":
+                screens = mod.get("frontend", {}).get("screens", [])
+            else:
+                screens = mod.get("screens", [])
+            for screen in (screens or []):
+                if isinstance(screen, dict):
+                    _check_screen_components(screen, mk)
+
+        # ── 12. MISSING_SOURCE_SECTION ────────────────────────────────────────
+        for res in results:
+            mk  = res.get("module_key") or res.get("module_name") or "?"
+            sids = res.get("source_chunk_ids") or []
+            if not sids:
+                _issue(
+                    "MISSING_SOURCE_SECTION",
+                    f"Module '{mk}' has no source_chunk_ids — "
+                    f"cannot trace artifacts back to document sections.",
+                    module_key=mk,
+                )
+
+    except Exception as exc:
+        logger.error(
+            "quality_gate_node: unexpected error during quality checks: %s. "
+            "Quality report will be partial.",
+            exc,
+        )
+        issues.append({
+            "check":       "LINTER_INTERNAL_ERROR",
+            "description": f"Linter crashed: {exc}",
+        })
+
+    # ── Build metrics ─────────────────────────────────────────────────────────
+    dedupe_summary = dedupe_report.get("summary") or {}
+    metrics: dict[str, Any] = {
+        "module_count_before_canonicalization": len(module_candidates),
+        "module_count_after_canonicalization":  len(canonical_modules),
+        "duplicate_module_clusters_merged":     dedupe_summary.get("duplicate_groups_merged", 0),
+        "duplicate_api_groups_found": sum(
+            1 for i in issues if i.get("check") == "DUPLICATE_API_INTENT"
+        ),
+        "enum_conflicts":      dedupe_summary.get("conflicts_flagged", 0),
+        "self_graph_edges_removed": dedupe_summary.get("self_edges_removed", 0),
+    }
+
+    # ── Derive status ──────────────────────────────────────────────────────
+    # Blocking checks → "repair_required" | warnings → "warning" | none → "pass"
+    blocking_checks = {
+        "DUPLICATE_MODULE_NAME",
+        "DUPLICATE_API_INTENT",
+        "DUPLICATE_DB_MODEL",
+        "SAME_ENUM_DIFFERENT_VALUES",
+        "SELF_GRAPH_EDGE",
+        "LINTER_INTERNAL_ERROR",
+    }
+    warning_checks = {
+        "MODULE_COUNT_WARNING",
+        "SUSPICIOUS_MODULE_NAME",
+        "CHILD_SECTION_EXTRACTED_AS_MODULE",
+        "ORPHAN_GRAPH_NODE",
+        "MISSING_SOURCE_SECTION",
+        "EMPTY_FILTER_PANEL",
+        "EMPTY_GRID_COLUMNS",
+        "FORM_WITHOUT_SUBMIT_ACTION",
+        "SAME_API_DIFFERENT_SCHEMA",
+    }
+
+    has_blocking = any(i.get("check") in blocking_checks for i in issues)
+    has_warnings = any(i.get("check") in warning_checks  for i in issues)
+    passed = not has_blocking
+
+    if has_blocking:
+        status = "repair_required"
+    elif has_warnings:
+        status = "warning"
+    else:
+        status = "pass"
+
+    suspicious_modules = [
+        i["module_key"]
+        for i in issues
+        if i.get("check") == "SUSPICIOUS_MODULE_NAME" and "module_key" in i
+    ]
+    dedupe_anomalies = [
+        i for i in issues
+        if i.get("check") in {"SAME_API_DIFFERENT_SCHEMA", "SAME_ENUM_DIFFERENT_VALUES"}
+    ]
+
+    quality_report: dict[str, Any] = {
+        # Plan-specified top-level keys (Section 5.9)
+        "status":             status,
+        "module_count":       len(canonical_modules),
+        "expected_range":     "4-8",
+        "suspicious_modules": suspicious_modules,
+        "dedupe_anomalies":   dedupe_anomalies,
+        "weak_modules":       [],   # reserved for future extension
+        # Legacy keys kept for backward compatibility
+        "passed":  passed,
+        "metrics": metrics,
+        "issues":  issues,
+    }
+
+    logger.info(
+        "quality_gate_node: %s — %d issue(s) found. "
+        "(modules %d→%d, %d merge(s), %d conflict(s), %d self-edge(s) removed)",
+        status.upper(),
+        len(issues),
+        metrics["module_count_before_canonicalization"],
+        metrics["module_count_after_canonicalization"],
+        metrics["duplicate_module_clusters_merged"],
+        metrics["enum_conflicts"],
+        metrics["self_graph_edges_removed"],
+    )
+
+    # Merge quality_report into the extraction dict that finalize_node produced.
+    updated_extraction = dict(state.get("extraction") or {})
+    updated_extraction["quality_report"] = quality_report
+
+    return {
+        "extraction":    updated_extraction,
+        "quality_report": quality_report,
+    }
+
+
+# ── Phase 2 (legacy label): Finalize (pure-Python collect + graph builder LLM) ─
 
 def _python_merge_results(
     results: list[ModuleResult],
     modules: list[dict[str, Any]],
+    canonical_modules: list[dict[str, Any]],
     mode: str,
 ) -> dict[str, Any]:
     """
     Pure-Python collect: assemble per-module extractions in segmentation order.
     No LLM call — instant. Mirrors Phase 2 of user_story_parser/llm_service.py.
+
+    When canonical_modules are available (Phase 1 path), sort by their order.
+    Falls back to the legacy modules list order for the legacy path.
     """
-    order_map: dict[str, int] = {m["name"]: idx for idx, m in enumerate(modules)}
-    sorted_results = sorted(
-        results, key=lambda r: order_map.get(r["module_name"], 999)
-    )
+    # Build order map: prefer canonical_modules order, fall back to modules list.
+    if canonical_modules:
+        order_map: dict[str, int] = {}
+        for idx, cm in enumerate(canonical_modules):
+            order_map[cm.get("module_key", "")] = idx
+            order_map[cm.get("display_name", "")] = idx
+    else:
+        order_map = {m["name"]: idx for idx, m in enumerate(modules)}
+
+    def _sort_key(r: ModuleResult) -> int:
+        # Prefer module_key ordering, fall back to module_name.
+        mk = r.get("module_key") or ""
+        if mk and mk in order_map:
+            return order_map[mk]
+        return order_map.get(r["module_name"], 999)
+
+    sorted_results = sorted(results, key=_sort_key)
 
     module_list = [
         {
-            "name":  res["module_name"],
-            "order": idx + 1,
+            "name":               res["module_name"],
+            "module_key":         res.get("module_key") or "",
+            "order":              idx + 1,
+            "source_chunk_ids": res.get("source_chunk_ids") or [],
             **res["extraction"].get("module", {}),
         }
         for idx, res in enumerate(sorted_results)
@@ -1462,20 +2459,39 @@ async def finalize_node(state: ExtractionState) -> dict[str, Any]:
     n = len(state["results"])
     logger.info("finalize_node: assembling %d module(s) + building dependency graph.", n)
 
+    canonical_modules: list[dict[str, Any]] = state.get("canonical_modules") or []
+
     # ── Pure-Python merge (instant) ───────────────────────────────────────────
-    extraction = _python_merge_results(state["results"], state["modules"], state["mode"])
+    extraction = _python_merge_results(
+        state["results"],
+        [],  # legacy modules list not used in chunk-based flow
+        canonical_modules,
+        state["mode"],
+    )
 
     # ── Graph builder LLM call (uses summaries only — small context) ──────────
     prompt_data   = _load_prompt("graph_builder")
     all_summaries = [r["summary"] for r in state["results"]]
 
-    # Build the ordered list of valid module IDs (snake_case) from module names.
-    # These are passed explicitly to the LLM so it cannot invent phantom nodes.
+    # Build the ordered list of valid module IDs.
+    # Phase 1 path: use module_key from canonical_modules for clean, stable IDs.
+    # Legacy path: derive from module_name as before.
     def _to_module_id(name: str) -> str:
         return name.lower().replace(" ", "_").replace("-", "_")
 
-    module_names   = [r["module_name"] for r in state["results"]]
-    valid_ids      = [_to_module_id(name) for name in module_names]
+    results = state["results"]
+    if canonical_modules:
+        # Use the module_key from each result (set by extract_module_node).
+        # Fall back to slugging the module_name if module_key is empty.
+        module_names = [r["module_name"] for r in results]
+        valid_ids = [
+            (r.get("module_key") or _to_module_id(r["module_name"]))
+            for r in results
+        ]
+    else:
+        module_names = [r["module_name"] for r in results]
+        valid_ids    = [_to_module_id(name) for name in module_names]
+
     module_ids_json = json.dumps(valid_ids, indent=2)
 
     user_prompt = _fmt(
@@ -1502,13 +2518,19 @@ async def finalize_node(state: ExtractionState) -> dict[str, Any]:
     graph = graph_result.get("graph", {})
 
     # Keep only nodes whose IDs are in the extracted set
-    filtered_nodes = [n for n in graph.get("nodes", []) if n.get("id") in valid_id_set]
+    filtered_nodes = [nd for nd in graph.get("nodes", []) if nd.get("id") in valid_id_set]
 
     # Ensure every extracted module has a node (fill gaps if LLM omitted any)
-    existing_ids = {n["id"] for n in filtered_nodes}
+    existing_ids = {nd["id"] for nd in filtered_nodes}
     for mid, mname in zip(valid_ids, module_names):
         if mid not in existing_ids:
-            filtered_nodes.append({"id": mid, "label": mname, "type": "feature", "description": None, "external_dependencies": []})
+            filtered_nodes.append({
+                "id": mid,
+                "label": mname,
+                "type": "feature",
+                "description": None,
+                "external_dependencies": [],
+            })
 
     # Keep only edges where both endpoints are valid extracted module IDs
     filtered_edges = [
@@ -1516,12 +2538,29 @@ async def finalize_node(state: ExtractionState) -> dict[str, Any]:
         if e.get("from") in valid_id_set and e.get("to") in valid_id_set
     ]
 
+    # ── Remove self-referencing edges and record them in dedupe_report ────────
+    from src.msbc.orchestration.utils.deduplication import remove_self_edges
+    filtered_edges, self_edge_ids = remove_self_edges(filtered_edges)
+
+    # Extend dedupe_report with self-edge removal results (populated here because
+    # the graph is not built until this node; global_deduplication_node runs first).
+    dedupe_report: dict[str, Any] = state.get("dedupe_report") or {}
+    if self_edge_ids or dedupe_report:
+        # Create a mutable copy so we don't mutate the state dict in-place.
+        dedupe_report = dict(dedupe_report)
+        existing_removed: list[str] = list(dedupe_report.get("self_edges_removed") or [])
+        all_removed = existing_removed + self_edge_ids
+        dedupe_report["self_edges_removed"] = all_removed
+        summary = dict(dedupe_report.get("summary") or {})
+        summary["self_edges_removed"] = len(all_removed)
+        dedupe_report["summary"] = summary
+
     # Recompute entry_points from filtered graph
     inbound_ids = {
         e["to"] for e in filtered_edges
         if e.get("relation") in ("depends_on", "calls")
     }
-    entry_points = [n["id"] for n in filtered_nodes if n["id"] not in inbound_ids]
+    entry_points = [nd["id"] for nd in filtered_nodes if nd["id"] not in inbound_ids]
 
     graph_result["graph"] = {
         "nodes":        filtered_nodes,
@@ -1540,4 +2579,16 @@ async def finalize_node(state: ExtractionState) -> dict[str, Any]:
         "finalize_node: complete — %d module(s), graph: %d nodes, %d edges.",
         n, node_count, edge_count,
     )
-    return {"extraction": extraction, "graph": graph_result["graph"], "all_usage": graph_usages}
+
+    # Include the deduplication report (Phase 2) as a top-level key in extraction.
+    # When Phase 2 nodes did not run (empty dedupe_report), an empty dict is inserted
+    # so downstream consumers always see the key and can safely check it.
+    extraction_output = dict(extraction)
+    if dedupe_report:
+        extraction_output["deduplication_report"] = dedupe_report
+
+    return {
+        "extraction": extraction_output,
+        "graph":      graph_result["graph"],
+        "all_usage":  (state.get("all_usage") or []) + graph_usages,
+    }

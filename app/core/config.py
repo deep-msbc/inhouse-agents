@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     # ── KUZU Graph DB ─────────────────────────────────────────────────────────
     KUZU_DB_PATH: str = "./data/toolkit_graph.kuzu"
 
+    # ── Code Generator ────────────────────────────────────────────────────────
+    CODEGEN_OUTPUT_ROOT: str = "./generated_frontend"
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_ignore_empty=True,

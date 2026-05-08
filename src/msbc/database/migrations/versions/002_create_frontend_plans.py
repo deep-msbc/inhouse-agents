@@ -35,7 +35,7 @@ def upgrade() -> None:
         ),
         sa.Column(
             "extraction_id",
-            sa.String(36),
+            UUID(as_uuid=True),
             sa.ForeignKey(
                 "requirement_extractions.id",
                 ondelete="CASCADE",

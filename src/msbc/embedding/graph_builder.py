@@ -623,12 +623,19 @@ def build_graph(db_path: str, examples_dir: Path | None = None) -> None:
         ``Path("correct_code_examples")`` relative to the current working
         directory.
     """
-    import os
-    # Only ensure the *parent* directory exists.  KUZU creates the db_path
-    # directory itself; pre-creating it causes a RuntimeError.
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    import subprocess as _sp
 
-    db = kuzu.Database(db_path)
+    db_file = Path(db_path).resolve()
+    abs_path = str(db_file)
+
+    # Remove stale directory if one exists from a previous botched run.
+    if db_file.is_dir():
+        _sp.run(["rm", "-rf", abs_path], check=True)
+        logger.info("Removed stale directory at '%s'.", abs_path)
+    # Ensure parent exists — Kuzu creates the DB file itself.
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    db = kuzu.Database(abs_path)
     conn = kuzu.Connection(db)
 
     logger.info("Building KUZU graph at '%s' …", db_path)
@@ -655,22 +662,24 @@ def rebuild_graph(db_path: str, examples_dir: Path | None = None) -> None:
     examples_dir :
         See :func:`build_graph`.
     """
-    # Only ensure the *parent* directory exists.
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    # For a true rebuild: wipe the existing DB directory entirely so kuzu
+    # starts with a clean slate. This avoids stale lock files and schema
+    # conflicts from previous (possibly incompatible) kuzu versions.
+    import subprocess as _sp
 
-    db = kuzu.Database(db_path)
+    db_file = Path(db_path).resolve()
+    abs_path = str(db_file)
+
+    # Delete existing DB file so Kuzu starts clean.
+    _sp.run(["rm", "-rf", abs_path], check=True)
+    # Ensure parent directory exists — Kuzu creates the file itself.
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+    logger.info("Cleared KUZU DB at '%s'.", abs_path)
+
+    db = kuzu.Database(abs_path)
     conn = kuzu.Connection(db)
 
-    logger.info("Rebuilding KUZU graph at '%s' — dropping all tables …", db_path)
-
-    for table_name in DROP_ORDER:
-        try:
-            conn.execute(f"DROP TABLE {table_name}")
-            logger.debug("Dropped table: %s", table_name)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Drop %s (non-fatal): %s", table_name, exc)
-
-    logger.info("All tables dropped. Rebuilding …")
+    logger.info("Rebuilding KUZU graph at '%s' — fresh schema …", db_path)
 
     _create_schema(conn)
     _populate_packages_and_components(conn)

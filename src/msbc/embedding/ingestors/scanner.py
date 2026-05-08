@@ -9,19 +9,26 @@ Set the monorepo root via::
 
     RTK_MONOREPO_PATH=C:/path/to/ReactToolKits   # in .env or as env var
 
+Scans
+-----
+• ``packages/*/src/``  — all TypeScript, TSX, SCSS, Markdown, JSON source files
+• ``packages/*/``      — package-root READMEs and build-config files (tsconfig, vite.config…)
+• Storybook story files (``.stories.tsx``) — included as ``content_type="doc"``
+• Monorepo root        — top-level README.md
+
 Skips
 -----
 • ``node_modules/``, ``dist/``, ``.storybook/``, ``__tests__/`` directories
-• ``*.test.*``, ``*.spec.*``, ``*.d.ts``, ``*.stories.*`` files
-• Empty files
-• Unrecognized file extensions (SVG, fonts, lock files, …)
+• ``*.test.*``, ``*.spec.*``, ``*.d.ts`` files
+• Empty files, lock files, binary assets
+• ``package.json`` files (not embedded by design)
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
@@ -41,6 +48,23 @@ SCAN_DIRS: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# PACKAGE_ROOTS: relative package directory → @msbc/* namespace
+# Used to pick up README.md and build-config files at the package root level.
+# ---------------------------------------------------------------------------
+
+PACKAGE_ROOTS: dict[str, str] = {
+    "packages/react-toolkit":    "@msbc/react-toolkit",
+    "packages/config-ui":        "@msbc/config-ui",
+    "packages/data-layer":       "@msbc/data-layer",
+    "packages/config-app-shell": "@msbc/config-app-shell",
+    "packages/import-utils":     "@msbc/import-utils",
+    "packages/utils":            "@msbc/utils",
+}
+
+# Root-level monorepo files to include (relative to monorepo root).
+_MONOREPO_ROOT_FILES: tuple[str, ...] = ("README.md",)
+
+# ---------------------------------------------------------------------------
 # Namespace → module_layer
 # ---------------------------------------------------------------------------
 
@@ -51,6 +75,7 @@ _NAMESPACE_LAYER: dict[str, str] = {
     "@msbc/config-app-shell": "shell",
     "@msbc/import-utils":     "utils",
     "@msbc/utils":            "utils",
+    "monorepo":               "infra",
 }
 
 # ---------------------------------------------------------------------------
@@ -61,6 +86,8 @@ _CODE_EXTS:    frozenset[str] = frozenset({".tsx", ".ts"})
 _STYLE_EXTS:   frozenset[str] = frozenset({".scss", ".css"})
 _DOC_EXTS:     frozenset[str] = frozenset({".md"})
 _CONFIG_EXTS:  frozenset[str] = frozenset({".json"})
+# Build-config source extensions scanned at package root level only
+_BUILD_CONFIG_EXTS: frozenset[str] = frozenset({".ts", ".js", ".json"})
 _ALL_EMBEDDABLE: frozenset[str] = _CODE_EXTS | _STYLE_EXTS | _DOC_EXTS | _CONFIG_EXTS
 
 # ---------------------------------------------------------------------------
@@ -114,6 +141,9 @@ class FileRecord:
 
     content: str
     """Raw UTF-8 file content loaded during scanning."""
+
+    doc_type: str = ""
+    """Optional doc sub-type: ``"readme"``, ``"storybook_story"``, ``"build_config"``."""
 
 
 # ---------------------------------------------------------------------------
@@ -221,8 +251,20 @@ def _should_skip(path: Path) -> bool:
     if name.endswith(".d.ts"):
         return True
 
-    # Test / spec / story files
-    if ".test." in name or ".spec." in name or ".stories." in name:
+    # Test / spec files (but NOT story files — they are included as docs)
+    if ".test." in name or ".spec." in name:
+        return True
+
+    # package.json — skipped by design
+    if name == "package.json":
+        return True
+
+    # Lock / ignore / RC files
+    _SKIP_NAMES = frozenset({
+        "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".prettierrc",
+        ".gitignore", "vite-env.d.ts", "vitest.shims.d.ts",
+    })
+    if name in _SKIP_NAMES:
         return True
 
     # Empty files
@@ -235,14 +277,37 @@ def _should_skip(path: Path) -> bool:
     return False
 
 
+def _should_skip_src(path: Path) -> bool:
+    """
+    Skip rule for files inside SCAN_DIRS source directories.
+    Identical to _should_skip but also skips backup files that embed noise.
+    """
+    if _should_skip(path):
+        return True
+    name = path.name
+    # Backup / generated files
+    if "-bkp." in name or name.endswith(".bkp.tsx") or name.endswith(".bkp.ts"):
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 def scan_toolkit(monorepo_root: Path) -> list[FileRecord]:
     """
-    Walk configured :data:`SCAN_DIRS` within *monorepo_root* and return a
-    :class:`FileRecord` for every embeddable source file.
+    Scan the RTK monorepo and return a :class:`FileRecord` for every
+    embeddable file across three scan passes:
+
+    1. ``SCAN_DIRS`` — package ``src/`` trees (code, style, JSON, markdown,
+       and ``.stories.tsx`` usage-example docs).
+    2. ``PACKAGE_ROOTS`` — per-package root files: ``README.md`` and build
+       config files (``tsconfig.json``, ``vite.config.ts``, etc.).
+    3. Monorepo root — top-level ``README.md``.
+
+    Deduplication is enforced via a ``seen`` set of ``rel_path`` values so
+    that a file discovered in multiple passes is only returned once.
 
     Parameters
     ----------
@@ -252,9 +317,26 @@ def scan_toolkit(monorepo_root: Path) -> list[FileRecord]:
     Returns
     -------
     list[FileRecord]
-        One record per embeddable file found under the configured scan dirs.
+        Deduplicated list of all embeddable files found.
     """
     records: list[FileRecord] = []
+    seen: set[str] = set()   # rel_path deduplication across all passes
+
+    # ── Helper ────────────────────────────────────────────────────────────────
+
+    def _read(path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            logger.warning("Cannot read '%s': %s", path, exc)
+            return None
+
+    def _add(rec: FileRecord) -> None:
+        if rec.rel_path not in seen:
+            seen.add(rec.rel_path)
+            records.append(rec)
+
+    # ── Pass 1: src/ directories ──────────────────────────────────────────────
 
     for scan_subdir, namespace in SCAN_DIRS.items():
         scan_abs = monorepo_root / scan_subdir
@@ -268,43 +350,156 @@ def scan_toolkit(monorepo_root: Path) -> list[FileRecord]:
             if not path.is_file():
                 continue
 
-            # Skip files inside excluded directories
             try:
                 rel_to_scan = path.relative_to(scan_abs)
             except ValueError:
                 continue
 
-            # Check all *parent* parts (not the file name itself)
+            # Skip files inside excluded directories
             if any(part in _SKIP_DIRS for part in rel_to_scan.parts[:-1]):
                 continue
 
-            if _should_skip(path):
+            if _should_skip_src(path):
                 continue
 
-            try:
-                content = path.read_text(encoding="utf-8", errors="replace")
-            except OSError as exc:
-                logger.warning("Cannot read '%s': %s", path, exc)
+            content = _read(path)
+            if content is None:
                 continue
 
             rel_path = str(path.relative_to(monorepo_root)).replace("\\", "/")
+            name = path.name
+            is_story = ".stories." in name
 
-            records.append(FileRecord(
-                rel_path=rel_path,
-                abs_path=path,
-                namespace=namespace,
-                file_category=_detect_file_category(rel_path, path.name),
-                language=_get_language(path),
-                content_type=_get_content_type(path),
-                module_layer=module_layer,
-                content_hash=_compute_hash(content),
-                size_bytes=path.stat().st_size,
-                content=content,
-            ))
+            if is_story:
+                # Story files → doc, even though they are TS/TSX code files
+                _add(FileRecord(
+                    rel_path=rel_path,
+                    abs_path=path,
+                    namespace=namespace,
+                    file_category="doc",
+                    language=_get_language(path),
+                    content_type="doc",
+                    module_layer=module_layer,
+                    content_hash=_compute_hash(content),
+                    size_bytes=path.stat().st_size,
+                    content=content,
+                    doc_type="storybook_story",
+                ))
+            else:
+                _add(FileRecord(
+                    rel_path=rel_path,
+                    abs_path=path,
+                    namespace=namespace,
+                    file_category=_detect_file_category(rel_path, name),
+                    language=_get_language(path),
+                    content_type=_get_content_type(path),
+                    module_layer=module_layer,
+                    content_hash=_compute_hash(content),
+                    size_bytes=path.stat().st_size,
+                    content=content,
+                ))
 
+    # ── Pass 2: package-root files ────────────────────────────────────────────
+
+    for pkg_rel, namespace in PACKAGE_ROOTS.items():
+        pkg_dir = monorepo_root / pkg_rel
+        if not pkg_dir.exists():
+            continue
+
+        module_layer = _NAMESPACE_LAYER.get(namespace, "unknown")
+
+        for path in sorted(pkg_dir.iterdir()):
+            if not path.is_file():
+                continue
+
+            name = path.name
+            ext = path.suffix.lower()
+            rel_path = str(path.relative_to(monorepo_root)).replace("\\", "/")
+
+            # README.md → doc chunk
+            if name == "README.md":
+                content = _read(path)
+                if content and path.stat().st_size > 0:
+                    _add(FileRecord(
+                        rel_path=rel_path,
+                        abs_path=path,
+                        namespace=namespace,
+                        file_category="doc",
+                        language="markdown",
+                        content_type="doc",
+                        module_layer=module_layer,
+                        content_hash=_compute_hash(content),
+                        size_bytes=path.stat().st_size,
+                        content=content,
+                        doc_type="readme",
+                    ))
+                continue
+
+            # Build-config files at package root only:
+            # tsconfig*.json, vite.config.ts, tsup.config.ts, eslint.config.*
+            _CONFIG_STEMS = ("tsconfig", "vite.config", "tsup.config", "eslint.config",
+                              "jest.config", "babel.config", "rollup.config")
+            is_build_config = (
+                ext in _BUILD_CONFIG_EXTS
+                and any(name.startswith(s) for s in _CONFIG_STEMS)
+                # skip package.json (explicit decision)
+                and name != "package.json"
+                and not name.endswith(".d.ts")
+                and not name.endswith("-lock.yaml")
+            )
+
+            if is_build_config:
+                content = _read(path)
+                if content and path.stat().st_size > 0:
+                    lang = _get_language(path)
+                    _add(FileRecord(
+                        rel_path=rel_path,
+                        abs_path=path,
+                        namespace=namespace,
+                        file_category="config",
+                        language=lang,
+                        content_type="config",
+                        module_layer=module_layer,
+                        content_hash=_compute_hash(content),
+                        size_bytes=path.stat().st_size,
+                        content=content,
+                        doc_type="build_config",
+                    ))
+
+    # ── Pass 3: monorepo root files ───────────────────────────────────────────
+
+    for root_file in _MONOREPO_ROOT_FILES:
+        path = monorepo_root / root_file
+        if not path.exists() or not path.is_file():
+            continue
+        content = _read(path)
+        if not content or path.stat().st_size == 0:
+            continue
+        rel_path = root_file
+        _add(FileRecord(
+            rel_path=rel_path,
+            abs_path=path,
+            namespace="monorepo",
+            file_category="doc",
+            language="markdown",
+            content_type="doc",
+            module_layer="infra",
+            content_hash=_compute_hash(content),
+            size_bytes=path.stat().st_size,
+            content=content,
+            doc_type="readme",
+        ))
+
+    # ── Summary log ───────────────────────────────────────────────────────────
+
+    from collections import Counter
+    ct_counts = Counter(r.content_type for r in records)
     logger.info(
-        "scan_toolkit: %d files found across %d SCAN_DIRS.",
+        "scan_toolkit: %d files found — code=%d style=%d doc=%d config=%d",
         len(records),
-        len(SCAN_DIRS),
+        ct_counts.get("code", 0),
+        ct_counts.get("style", 0),
+        ct_counts.get("doc", 0),
+        ct_counts.get("config", 0),
     )
     return records

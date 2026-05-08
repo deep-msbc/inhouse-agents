@@ -2,9 +2,13 @@
 __pycache__/
 *.py[oc]
 build/
-dist/
 wheels/
 *.egg-info
+*dist/
+
+# Node.js dependencies and build artifacts
+*node_modules/
+
 
 # Virtual environments
 venv/
@@ -14,11 +18,13 @@ venv/
 
 # Database folder (local SQLite storage, not for version control)
 generated_codes/
+correct_code_examples/django_drf/
 
 *.pem
 
 # Logs and temporary files
 logs/
+output/
 
 # IDE and editor files
 .vscode/
@@ -29,10 +35,18 @@ SKELETON/
 # Unwanted README files
 CODEBASE_OVERVIEW.md
 CODEBASE_INDEX.json
-scratch_files.txtuser_stories/
-responses/
-user_story_parser/
-user_stories/
+scratch_files.txt
 
 *.kuzu
-*.json
+
+user_story_parser/
+
+generated_projects/
+generated_frontend_v1/
+old_code_generator/
+
+AGENT_MISTAKES.md
+CODEGEN_REVISED_IMPLEMENTATION_PLAN.md
+FRONTEND_CODEGEN_CLAUDE_REVIEW_PROMPT.md
+FRONTEND_CODEGEN_PLAN.md
+FRONTEND_CODEGEN_OVERVIEW.md

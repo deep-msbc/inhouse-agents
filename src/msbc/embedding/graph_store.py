@@ -18,6 +18,7 @@ Design notes
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import kuzu
@@ -38,11 +39,26 @@ class KuzuStore:
         Defaults to ``settings.KUZU_DB_PATH``.
     """
 
-    def __init__(self, db_path: str | None = None) -> None:
+    def __init__(self, db_path: str | None = None, read_only: bool = True) -> None:
         self._db_path = db_path or settings.KUZU_DB_PATH
-        self._db   = kuzu.Database(self._db_path)
+        self._available = False
+        self._db = None
+        self._conn = None
+
+        db_file = Path(self._db_path).resolve()
+        self._db_path = str(db_file)
+        if not db_file.exists():
+            logger.warning(
+                "KuzuStore: DB not found at '%s' — graph queries will return empty results. "
+                "Run 'python scripts/build_graph.py' to build the graph.",
+                self._db_path,
+            )
+            return
+
+        self._db   = kuzu.Database(self._db_path, read_only=read_only)
         self._conn = kuzu.Connection(self._db)
-        logger.info("KuzuStore opened at '%s'.", self._db_path)
+        self._available = True
+        logger.info("KuzuStore opened at '%s' (read_only=%s).", self._db_path, read_only)
 
     # ------------------------------------------------------------------
     # Generic query
@@ -72,6 +88,9 @@ class KuzuStore:
             Wraps any KUZU runtime error with the offending query appended
             so callers can log it without losing context.
         """
+        if not self._available:
+            return []
+
         try:
             res = self._conn.execute(cypher)
         except Exception as exc:  # noqa: BLE001
@@ -305,6 +324,10 @@ ORDER BY p.name
             f"MATCH (e:Example {{example_id: '{_esc(example_id)}'}}) "
             f"SET e.qdrant_chunk_ids = {id_list}"
         )
+        if not self._available:
+            logger.warning("KuzuStore unavailable — skipping qdrant_chunk_ids update for '%s'.", example_id)
+            return
+
         try:
             self._conn.execute(cypher)
             logger.debug(

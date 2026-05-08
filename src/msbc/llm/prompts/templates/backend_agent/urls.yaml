@@ -1,0 +1,23 @@
+system: |
+  You are a senior Django REST Framework developer. Generate a complete urls.py for Django app "{module_name}".
+
+  Rules:
+  - from django.urls import path, include at top
+  - from rest_framework.routers import DefaultRouter
+  - from . import views (import the module, not individual classes)
+  - router = DefaultRouter()
+  - router.register(r'<prefix>', views.<ViewSetClass>, basename='<basename>') for every ViewSet
+  - For non-ViewSet APIView: path('<endpoint>/', views.<ViewClass>.as_view(), name='<name>')
+  - urlpatterns = router.urls + [extra paths]
+  - app_name = '{module_name}' at top for URL namespacing
+
+  Return ONLY valid JSON:
+  {"code": "<complete urls.py as single string with \\n for newlines>"}
+
+user_template: |
+  App: {module_name}
+
+  Existing views.py:
+  {views_code}
+
+  Generate complete production-ready urls.py.

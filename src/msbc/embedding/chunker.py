@@ -577,6 +577,7 @@ def build_embed_text(
     file_name: str,
     msbc_imports: list[str],
     chunk_exports: list[str],
+    section_title: str = "",
 ) -> str:
     """
     Build the enriched text string that will be vectorised.
@@ -587,7 +588,11 @@ def build_embed_text(
     config-ui" and "when should I use ConfigurableDashboard" resolve
     correctly even when the code itself does not repeat these words.
 
-    Format
+    For ``doc`` and ``config`` content types the header is adapted to
+    carry ``section_title`` and ``file_category`` instead of import/export
+    metadata which is not meaningful for those file types.
+
+    Format (code / style)
     ------
     [{chunk_type}: {symbol_name}] [{namespace} / {file_category}]
     Package: {namespace} | File: {file_name}
@@ -597,6 +602,14 @@ def build_embed_text(
     Exports: {X, Y}
     ---
     {chunk_text}
+
+    Format (doc / config)
+    ------
+    [{chunk_type}: {section_title or symbol_name}] [{file_category} / {namespace}]
+    Package: {namespace} | File: {file_name}
+    Section: {section_title}   <- when present
+    ---
+    {chunk_text}
     """
     header_parts: list[str] = []
 
@@ -604,24 +617,162 @@ def build_embed_text(
     header_parts.append(f"[{label}] [{namespace} / {file_category}]")
     header_parts.append(f"Package: {namespace} | File: {file_name}")
 
+    if section_title:
+        header_parts.append(f"Section: {section_title}")
+
     # Inject when_to_use / do_not_use_when from toolkit_knowledge when the
     # symbol name matches a known component.  This travels inside the vector
     # so retrieval queries about usage guidance hit the correct chunk.
-    guidance = _COMPONENT_GUIDANCE.get(symbol_name, {})
-    if guidance.get("when_to_use"):
-        wtu = " | ".join(guidance["when_to_use"])
-        header_parts.append(f"Use when: {wtu}")
-    if guidance.get("do_not_use_when"):
-        dnu = " | ".join(guidance["do_not_use_when"])
-        header_parts.append(f"Do not use when: {dnu}")
+    if file_category not in ("doc", "config"):
+        guidance = _COMPONENT_GUIDANCE.get(symbol_name, {})
+        if guidance.get("when_to_use"):
+            wtu = " | ".join(guidance["when_to_use"])
+            header_parts.append(f"Use when: {wtu}")
+        if guidance.get("do_not_use_when"):
+            dnu = " | ".join(guidance["do_not_use_when"])
+            header_parts.append(f"Do not use when: {dnu}")
 
-    if msbc_imports:
-        header_parts.append(f"MSBC imports: {', '.join(msbc_imports[:8])}")
-    if chunk_exports:
-        header_parts.append(f"Exports: {', '.join(chunk_exports[:8])}")
+        if msbc_imports:
+            header_parts.append(f"MSBC imports: {', '.join(msbc_imports[:8])}")
+        if chunk_exports:
+            header_parts.append(f"Exports: {', '.join(chunk_exports[:8])}")
 
     header = "\n".join(header_parts)
     return f"{header}\n---\n{chunk_text}"
+
+
+# ---------------------------------------------------------------------------
+# Non-TS chunking strategies (markdown, JSON, SCSS)
+# ---------------------------------------------------------------------------
+
+# Heading detection: lines starting with one or more `#` characters.
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
+
+# SCSS/CSS rule block: a non-whitespace, non-comment line that opens a block
+_SCSS_RULE_START_RE = re.compile(r"^(?!//|/\*|\s)(.+?)\s*\{", re.MULTILINE)
+
+
+def _chunk_markdown(
+    source: str,
+    file_path: str,
+    file_stem: str,
+) -> list[tuple[str, str, str]]:
+    """
+    Split a Markdown document at heading boundaries.
+
+    Each heading + its body text forms one chunk.  If the document starts
+    with preamble text before the first heading, that preamble becomes its
+    own chunk labelled with the file stem.
+
+    Returns ``(text, section_title, "section")`` tuples.
+    """
+    headings = list(_HEADING_RE.finditer(source))
+
+    if not headings:
+        # No headings — return the whole file as one chunk
+        return [(source.strip(), file_stem, "section")]
+
+    results: list[tuple[str, str, str]] = []
+
+    # Preamble (text before the first heading)
+    preamble = source[: headings[0].start()].strip()
+    if preamble:
+        results.append((preamble, file_stem, "section"))
+
+    for i, match in enumerate(headings):
+        start = match.start()
+        end = headings[i + 1].start() if i + 1 < len(headings) else len(source)
+        section_text = source[start:end].strip()
+        if section_text:
+            heading_text = match.group(2).strip()
+            results.append((section_text, heading_text, "section"))
+
+    return results if results else [(source.strip(), file_stem, "section")]
+
+
+def _chunk_json(
+    source: str,
+    file_path: str,
+    file_stem: str,
+) -> list[tuple[str, str, str]]:
+    """
+    Chunk a JSON config file.
+
+    Small files (below ``SMALL_FILE_THRESHOLD`` tokens) → single chunk.
+    Large files → attempt to split at top-level key boundaries by finding
+    lines that match the pattern ``  "key":`` at indent depth 2.  Each
+    top-level key and its value subtree becomes one chunk.
+
+    Falls back to the whole file if the JSON is compact or splitting
+    would produce too-small fragments.
+
+    Returns ``(text, key_name, "json_config")`` tuples.
+    """
+    if count_tokens_approx(source) < SMALL_FILE_THRESHOLD:
+        return [(source.strip(), file_stem, "json_config")]
+
+    # Try splitting at top-level keys (lines like `  "key":`)
+    _TOP_KEY_RE = re.compile(r'^  "[^"]+"\s*:', re.MULTILINE)
+    boundaries = [m.start() for m in _TOP_KEY_RE.finditer(source)]
+
+    if not boundaries or len(boundaries) < 3:
+        # Too few keys or compact format — single chunk
+        return [(source.strip(), file_stem, "json_config")]
+
+    results: list[tuple[str, str, str]] = []
+    for i, start in enumerate(boundaries):
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else len(source)
+        segment = source[start:end].strip().rstrip(",").strip()
+        if not segment:
+            continue
+        # Extract key name from first line
+        first_line = segment.split("\n", 1)[0]
+        key_match = re.search(r'"([^"]+)"', first_line)
+        key_name = key_match.group(1) if key_match else f"key_{i}"
+        results.append((segment, key_name, "json_config"))
+
+    return results if results else [(source.strip(), file_stem, "json_config")]
+
+
+def _chunk_scss(
+    source: str,
+    file_path: str,
+    file_stem: str,
+) -> list[tuple[str, str, str]]:
+    """
+    Split an SCSS/CSS file at top-level rule block boundaries.
+
+    Heuristic: lines that start at column 0, are not comments, and open
+    a ``{`` block are treated as rule boundaries.  Everything from one
+    such line to the next forms one chunk.
+
+    Preamble (variable declarations, ``@import``, ``@use`` directives before
+    the first rule) is returned as a leading chunk.
+
+    Returns ``(text, selector, "css_rule")`` tuples.
+    """
+    boundaries = [m.start() for m in _SCSS_RULE_START_RE.finditer(source)]
+
+    if not boundaries:
+        return [(source.strip(), file_stem, "css_rule")]
+
+    results: list[tuple[str, str, str]] = []
+
+    preamble = source[: boundaries[0]].strip()
+    if preamble:
+        results.append((preamble, file_stem, "css_rule"))
+
+    for i, start in enumerate(boundaries):
+        end = boundaries[i + 1] if i + 1 < len(boundaries) else len(source)
+        segment = source[start:end].strip()
+        if not segment:
+            continue
+        # Extract selector from the opening line
+        first_line = segment.split("\n", 1)[0].strip()
+        selector = first_line.rstrip("{").strip() or f"rule_{i}"
+        results.append((segment, selector, "css_rule"))
+
+    return results if results else [(source.strip(), file_stem, "css_rule")]
 
 
 # ---------------------------------------------------------------------------
@@ -685,11 +836,20 @@ def chunk_toolkit_file(
     # ── Step 2: TypeScript / TSX → AST chunking ──────────────────────────────
     elif ext in (".ts", ".tsx"):
         raw = _ast_chunk_typescript(source, file_path, ext, all_file_exports)
-    # ── Step 3: other files → blank-line fallback ─────────────────────────────
+    # ── Step 3: Markdown → heading-aware chunking ─────────────────────────────
+    elif ext == ".md":
+        raw = _chunk_markdown(source, file_path, Path(file_name).stem)
+    # ── Step 4: SCSS / CSS → rule-block chunking ──────────────────────────────
+    elif ext in (".scss", ".css"):
+        raw = _chunk_scss(source, file_path, Path(file_name).stem)
+    # ── Step 5: JSON → top-level-key chunking ─────────────────────────────────
+    elif ext == ".json":
+        raw = _chunk_json(source, file_path, Path(file_name).stem)
+    # ── Step 6: other files → blank-line fallback ─────────────────────────────
     else:
         raw = _fallback_chunk(source)
 
-    # ── Step 4: merge pass ────────────────────────────────────────────────────
+    # ── Step 7: merge pass ────────────────────────────────────────────────────
     import_prefix = ""
     if ext in (".ts", ".tsx"):
         import_lines = [
@@ -700,7 +860,7 @@ def chunk_toolkit_file(
 
     merged = _merge_small_chunks(raw, import_prefix)
 
-    # ── Step 5: split pass ────────────────────────────────────────────────────
+    # ── Step 8: split pass ────────────────────────────────────────────────────
     final_raw: list[tuple[str, str, str]] = []
     for seg, name, ctype in merged:
         final_raw.extend(_split_large_chunk(seg, name, ctype))
@@ -709,9 +869,16 @@ def chunk_toolkit_file(
     total = len(final_raw)
     results: list[ChunkResult] = []
 
+    # For non-code files, sym_name doubles as the section title
+    is_doc_or_config = file_category in ("doc", "config") or ext in (".md", ".json", ".scss", ".css")
+
     for idx, (seg_text, sym_name, ctype) in enumerate(final_raw):
         cid = make_chunk_id(file_path, idx)
         chunk_exports = _chunk_level_exports(seg_text, all_file_exports)
+
+        # Use sym_name as section_title for doc/config chunks where it carries
+        # the heading text or JSON key name rather than a code symbol name.
+        section_title = sym_name if is_doc_or_config else ""
 
         embed_text = build_embed_text(
             chunk_text=seg_text,
@@ -722,6 +889,7 @@ def chunk_toolkit_file(
             file_name=file_name,
             msbc_imports=msbc_imports,
             chunk_exports=chunk_exports,
+            section_title=section_title,
         )
 
         results.append(ChunkResult(

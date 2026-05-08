@@ -46,6 +46,13 @@ class ExtractionMode(str, Enum):
     FULL_STACK = "full_stack"
 
 
+class GenerationMode(str, Enum):
+    """djcli invocation mode for the backend scaffolding step."""
+    STARTPROJECT  = "startproject"
+    STARTAPP      = "startapp"
+    STARTSERVICES = "startservices"
+
+
 # ─── CLI planning ─────────────────────────────────────────────────────────────
 
 class CLIStrategy(BaseModel):
@@ -55,7 +62,7 @@ class CLIStrategy(BaseModel):
     Produced by the invoker before subprocess execution — allows dry-run
     inspection without actually running the CLI.
     """
-    command: Literal["startproject", "startapp", "noop"]
+    command: Literal["startproject", "startapp", "startservices", "noop"]
     project_name: str
     app_names: List[str]
     existing_project_path: Optional[str] = None
@@ -68,9 +75,15 @@ class CLIInvokerInput(BaseModel):
     Typed input for the djcli subprocess wrapper.
 
     Built from ExtractionOutput (Stage 1 output) before invoking the CLI.
-    app_names  — sanitised, unique Django app identifiers (snake_case).
+    app_names    — sanitised, unique Django app identifiers (snake_case).
     module_names — original module names before sanitisation (preserved for
                    display and traceability).
+    output_path  — absolute or relative directory where djcli writes the
+                   generated project.  Caller-supplied — NOT read from env var.
+                   Fallback resolution order (in cli_invoker.py):
+                     1. This field (caller wins)
+                     2. DJCLI_OUTPUT_DIR env var
+                     3. ./generated_projects/{project_name}
 
     LOCKED:
       use_api  = True  — --api flag is always passed to djcli.
@@ -80,10 +93,13 @@ class CLIInvokerInput(BaseModel):
     framework: Framework
     app_names: List[str]                                         # sanitized + unique
     module_names: List[str]                                      # originals pre-sanitization
+    output_path: str                                             # caller-supplied; see fallback chain in cli_invoker.py
     use_api: bool = True                                         # LOCKED — always True
     use_auth: bool = False                                       # LOCKED — never True
-    command: Literal["startproject", "startapp", "noop"] = "startproject"
+    command: Literal["startproject", "startapp", "startservices", "noop"] = "startproject"
     existing_project_path: Optional[str] = None
+    generation_mode: GenerationMode = GenerationMode.STARTPROJECT
+    existing_project_name: Optional[str] = None
 
 
 # ─── CLI result ───────────────────────────────────────────────────────────────

@@ -263,6 +263,7 @@ async def _process_file(
             file_imports=file_imports,
             chunk_exports=chunk.chunk_exports,
             msbc_imports=msbc_symbols,
+            text=chunk.text,
             text_hash=_text_hash(chunk.text_to_embed),
         )
 

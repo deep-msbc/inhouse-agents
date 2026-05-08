@@ -78,9 +78,9 @@ class RequirementRepository(BaseRepository[RequirementExtraction]):
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
-    def get_by_run_id(self, run_id: uuid.UUID) -> RequirementExtraction | None:
+    def get_by_run_id(self, run_id: uuid.UUID | str) -> RequirementExtraction | None:
         """Fetch a single extraction run by its UUID."""
-        return self.get_by_id(run_id)
+        return self.get_by_id(str(run_id))
 
     def list_by_user_story(
         self,

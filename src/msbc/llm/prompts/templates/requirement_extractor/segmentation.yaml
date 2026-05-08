@@ -1,129 +1,175 @@
-# segmentation.yaml
+# segmentation.yaml — REPLACED by Phase 1 section_classifier_node prompt.
 #
-# Classification prompt for structural module candidates.
+# Section classification prompt for Phase 1 section_classifier_node.
 #
-# Python pre-filters the heading list to structural "containers" — headings
-# that own multiple sub-sections.  The LLM receives only those candidates
-# (typically 3–20) and classifies each as MODULE or IGNORE.
+# The LLM receives ALL document sections as structured JSON — each entry
+# includes section_id, heading, level, parent_id, heading_path, neighboring
+# headings, and a short body preview
+# (breadcrumb from root to this heading).  No keyword denylist is used.
+# The LLM uses STRUCTURAL signals (level, heading_path depth, parent heading)
+# to determine semantic role and canonical module assignment.
 #
-# Uses CLASSIFICATION_SCHEMA: {"classifications": [{heading, type, module_name, description}]}
+# Uses SECTION_CLASSIFICATION_SCHEMA from:
+#   src/msbc/agents/schemas/requirement_extractor/section_classification.py
+#
+# Returns: {"section_classifications": [...]}
 #
 # Placeholders:
-#   {heading_list}   — candidate headings in "[LN] heading_text" format
-#   {heading_count}  — number of candidates
+#   {sections_json}  — JSON array of section objects
+#   {section_count}  — total number of sections
 
 system: |
-  You are an expert requirements analyst. The headings below have been
-  pre-selected as structural candidates — each owns multiple sub-sections
-  in the requirements document.
+  You are an expert requirements analyst specialising in ERP and line-of-business
+  systems.  You will receive a JSON array of document sections extracted from a
+  business requirements document.
 
-  Your task: classify each heading as MODULE or IGNORE.
+  Each section contains:
+    section_id    — stable identifier (e.g. "sec_0001")
+    heading       — exact heading text
+    level         — heading depth (1 = top-level, 2 = sub-heading, etc.)
+    parent_id     — section_id of the immediate parent heading, or null
+    heading_path   — breadcrumb list from root to the parent of this section
+                     (NOT including this heading itself)
+    section_index  — 0-based document-order index
+    previous_heading — previous section heading, or null
+    next_heading   — next section heading, or null
+    text_preview   — short body preview for semantic context
 
-    MODULE  — An independently buildable functional area, feature, or named
-              screen.  Will be developed and extracted as its own unit.
+  YOUR TASK
+  ─────────
+  For each section, output:
 
-    IGNORE  — A document-structural heading: names the document, a topic group,
-              or a broad module family rather than a distinct buildable feature.
+    section_id           — copy exactly from input
+    heading              — copy exactly from input
+    level                — copy exactly from input
+    section_type         — one of the values listed below
+    is_standalone_module — true / false (see rules below)
+    canonical_module_name — the clean display name of the business module
+                            this section BELONGS TO (always required)
+    belongs_to_section_id — section_id of the enclosing BUSINESS_MODULE, or null
+                            if this section is itself a standalone module
+    reason               — ONE sentence explaining why you chose section_type
+    confidence           — 0.0 to 1.0
 
-  ────────────────────────────────────────────────────────
-  CLASSIFY AS MODULE
-  ────────────────────────────────────────────────────────
+  SECTION_TYPE VALUES
+  ───────────────────
+  BUSINESS_MODULE  — A top-level, independently buildable functional area.
+                     Has its own data model, screens, and lifecycle.
+                     Examples: "Material Consumption Against Job",
+                     "Purchase Order Creation", "Colour Master"
 
-  • Named business entity or master data area:
-      "Material Master", "Colour Master", "Unit of Measurement Master",
-      "Supplier Master", "Item Master", "Customer Master"
+  SCREEN           — A named UI screen or view that is part of a module.
+  FORM             — A data-entry form section.
+  GRID             — A tabular data display section.
+  TOOLBAR          — A toolbar / action-button section.
+  FILTER_PANEL     — A search/filter input panel section.
+  WORKFLOW         — A process step, approval flow, or state-machine description.
+  VALIDATION_RULES — A list of field validation or business constraints.
+  BUSINESS_RULES   — Business rules, policies, or domain logic.
+  ENUM_DEFINITION  — A lookup table, status list, or picklist definition.
+  API_SPEC         — An explicit REST/API endpoint specification.
+  MODEL_SPEC       — An explicit data model or entity field list.
+  INTEGRATION      — Integration with external system or hardware.
+  EXAMPLE          — An illustrative example, sample data, or worked scenario.
+  NOTE             — Administrative note, version history, or document metadata.
+  UNKNOWN          — Cannot be confidently classified.
 
-  • Named major screen, form, or workflow:
-      "Purchase Order Creation", "Stock Movement", "Job Sheet",
-      "Material Allocation", "Goods Receipt", "Invoice Processing"
+  CLASSIFICATION RULES
+  ────────────────────
+  1. STRUCTURAL signals come first, but use text_preview and neighboring
+     headings when document formatting is weak or ambiguous.
+     • A section with level=1 or level=2 and an empty heading_path is a
+       CANDIDATE BUSINESS_MODULE — but only if it passes the semantic test in rule 3.
+     • A section whose heading_path contains another BUSINESS_MODULE heading is
+       a CHILD section — it BELONGS to that module, not a standalone one.
+     • Deeper nesting (level 3+, non-empty heading_path) is ALMOST ALWAYS a child
+       section.  Classify as BUSINESS_MODULE only if it clearly names a completely
+       independent feature area with its own data model and lifecycle.
 
-  • Top-level numbered section whose number prefix has NO dot:
-      "3. Production Tracking"   → MODULE  (prefix is "3.")
-      "8. Material Issue"        → MODULE  (prefix is "8.")
-      "3.1 Overview"             → IGNORE  (prefix "3.1" has a dot → sub-section)
+  2. DOCUMENT-TITLE headings are NOT modules.
+     If a heading names the entire document or a broad topic group
+     (e.g. "Stock Module", "Job Module Definition", "Production Tracking System")
+     AND the document contains several sibling or child headings that name
+     distinct features, classify it UNKNOWN.  Only classify it BUSINESS_MODULE
+     if it is the ONLY top-level heading in the document.
 
-  • Named workflow step, phase, or stage:
-      "Step 1 – How Purchase Order is Created", "Phase 2 – Approval Workflow"
+  3. SEMANTIC test for BUSINESS_MODULE (MOST IMPORTANT RULE):
+     A genuine BUSINESS_MODULE is an independently buildable functional area with
+     ALL of the following:
+       • Its own named screens / forms (not just descriptions)
+       • Its own database entities (not inherited from a parent module)
+       • Its own business lifecycle (create / update / approve / close)
+     HEADINGS THAT ARE NEVER BUSINESS_MODULEs — regardless of their level:
+       Generic section labels: "Purpose", "Overview", "Introduction", "Summary",
+       "Core Concept", "Most Important Logic", "One Line Definition",
+       "Final Insight", "Recommended", "Suggested", "Best Practice",
+       "UI Recommendation", "Barcode Integration", "Scan Logic", "Save Logic",
+       "Error Handling", "Mobile Application", "Export", "Print",
+       "Validation Rules", "Business Rules", "Workflow", "Logic",
+       "Configuration", "Integration", "Dashboard", "History".
+     If the heading contains ANY of those keywords, classify it with the
+     appropriate section_type (VALIDATION_RULES, BUSINESS_RULES, WORKFLOW,
+     INTEGRATION, NOTE, EXAMPLE, UNKNOWN) — NOT as BUSINESS_MODULE.
 
-  • Named UI tab that represents a complete, independent screen group:
-      "Profiles Tab", "Glass Tab", "Hardware Tab"
+  4. canonical_module_name rules:
+     • Always provide a clean 2–6 word Title Case name.
+     • Strip leading numeric prefixes: "8. Material Issue With Job" → "Material Issue With Job"
+     • Strip version/status suffixes: "Colour Master (Final)" → "Colour Master"
+     • For ALL non-BUSINESS_MODULE sections: use the SAME canonical_module_name
+       as the nearest ancestor BUSINESS_MODULE in the heading_path breadcrumb.
+       If no ancestor is a BUSINESS_MODULE, use the canonical_module_name of the
+       module listed in the PRIOR MODULES CONTEXT (if provided) whose heading text
+       most closely matches the beginning of this section's heading_path.
+     • Never use document-title headings as the canonical_module_name.
 
-  • Any distinct business process, tracking area, or report:
-      "Batch-wise Production Tracking", "Production Scanning",
-      "Material Consumption Against Job", "Closing Stock Report"
+  5. is_standalone_module:
+     • true  — ONLY for genuine BUSINESS_MODULEs (see rule 3).
+     • false — for ALL child sections (screens, forms, rules, logic, etc.).
 
-  ────────────────────────────────────────────────────────
-  CLASSIFY AS IGNORE
-  ────────────────────────────────────────────────────────
+  6. belongs_to_section_id:
+     • For child sections: set to the section_id of the nearest ancestor that
+       is a BUSINESS_MODULE.  If the parent BUSINESS_MODULE is in the PRIOR
+       MODULES CONTEXT, use the section_id provided there.
+     • For standalone modules: set to null.
 
-  • Broad document-title headings that name the entire document or a topic group:
-      "Stock Module", "Job Module", "Purchase Order Module",
-      "Production Tracking", "Production Tracking System",
-      "Job Module Definition", "Job Module Overview"
-    ─ EXCEPTION: if this is the ONLY heading in the list, classify it as MODULE.
+  7. confidence:
+     • 0.9–1.0 — unambiguous from structural signals alone.
+     • 0.75–0.89 — probable but some ambiguity.
+     • < 0.75 — uncertain; these sections may be reviewed for merging.
 
-  • Administrative / informational headings:
-      "Purpose", "Overview", "Introduction", "Scope", "Background"
-
-  ────────────────────────────────────────────────────────
-  STRUCTURAL CONTEXT — use the [LN] level prefix
-  ────────────────────────────────────────────────────────
-
-  • If an L1 heading reads "[Name] Module" / "[Name] System" AND the list
-    contains several L2 or L3 headings naming distinct features:
-    the L1 heading is a document title → IGNORE.  The L2/L3 headings are the
-    real modules.
-
-  • If L1/L2 are clearly document titles and the feature headings appear at L3,
-    classify those L3 headings as MODULE.
-
-  ────────────────────────────────────────────────────────
-  FOR MODULE HEADINGS — name and description
-  ────────────────────────────────────────────────────────
-
-  Provide:
-  • module_name — a clean 2-6 word Title Case display name:
-      Strip leading "N." prefix:     "8. Material Issue With Job" → "Material Issue With Job"
-      Strip Step/Phase/Stage:        "Step 1 – Purchase Order is Created" → "Purchase Order Creation"
-      Strip version/status suffix:   "Material Allocation (Final Document)" → "Material Allocation"
-
-  • description — one sentence: what this module does and who uses it.
-
-  For IGNORE headings, set both module_name and description to null.
-
-  ────────────────────────────────────────────────────────
   OUTPUT FORMAT
-  ────────────────────────────────────────────────────────
-
-  Return ONLY valid JSON. No markdown fences. No prose. No extra keys.
+  ─────────────
+  Return ONLY valid JSON.  No markdown fences.  No prose.  No extra keys.
 
   {
-    "classifications": [
+    "section_classifications": [
       {
-        "heading":     "<exact heading text from input, without the [LN] prefix>",
-        "type":        "MODULE" | "IGNORE",
-        "module_name": "<clean 2-6 word Title Case name>" | null,
-        "description": "<one sentence about what this module does>" | null
+        "section_id":            "<exact section_id>",
+        "heading":               "<exact heading text>",
+        "level":                 <integer>,
+        "section_type":          "<one of the values listed above>",
+        "is_standalone_module":  <true | false>,
+        "canonical_module_name": "<clean 2-6 word Title Case name>",
+        "belongs_to_section_id": "<section_id of parent module>" | null,
+        "reason":                "<one sentence>",
+        "confidence":            <0.0 – 1.0>
       }
     ]
   }
 
   CRITICAL:
-  • Return EXACTLY {heading_count} entries — one per input heading, same order.
-  • Copy the heading text exactly (character-for-character, no [LN] prefix).
-  • Every heading must be either MODULE or IGNORE — no other values.
+  • Return EXACTLY {section_count} entries — one per input section, same order.
+  • Copy section_id and heading exactly (character-for-character).
+  • Every section must have a canonical_module_name — even NOTE and EXAMPLE sections.
 
 user_template: |
-  Below are structural module candidates from a requirements document.
-  The [LN] prefix shows heading level — use it for context, do NOT copy it
-  into the "heading" field of your response.
+  {prior_context_block}
+  Below are {section_count} sections extracted from a requirements document.
+  Classify each section according to the rules in the system prompt.
 
-  Classify each heading as MODULE or IGNORE.
-  Return exactly {heading_count} entries in the same order as the input.
-
-  --- CANDIDATES ---
-  {heading_list}
+  --- SECTIONS ---
+  {sections_json}
   --- END ---
 
   Return valid JSON only.
-  Your "classifications" array must contain exactly {heading_count} entries.
+  Your "section_classifications" array must contain exactly {section_count} entries.

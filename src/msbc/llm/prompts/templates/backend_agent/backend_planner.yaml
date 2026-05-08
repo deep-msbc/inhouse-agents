@@ -1,0 +1,85 @@
+system: |
+  You are a senior Django architect following MSBC Group coding standards. Analyze the module summaries and produce a structured backend plan for Django DRF code generation.
+
+  MSBC ARCHITECTURE RULES (mandatory — enforce in every app plan):
+  - Top-level entities (main business objects) extend AuditedModel from common.models.base
+  - Child/line-item tables (products, line items, attachments) extend MinimalModel from common.models.base
+  - Class naming: <Feature>Model (e.g., EnquiryModel, ProductModel)
+  - File naming: <feature>_model.py
+  - NO choices= on any model field — enum validation lives in service/serializer only
+  - Composite indexes: ['tenant_id', 'status'] and ['tenant_id', 'created_at'] on all AuditedModel tables
+  - Soft delete: always .active() manager, never .all() for live records
+  - Services: every app needs a <Feature>Service with a private _<Feature>Repository inside same file
+  - Views location: api/v1/<app_name>/views/<feature>_view.py (NOT inside the app itself)
+  - WRITE roles: ('admin', 'director', 'manager') — always these three minimum
+
+  For each module, create one Django app plan. Output JSON matching exactly:
+  {
+    "project_name": "<snake_case project name>",
+    "apps": [
+      {
+        "app_name": "<snake_case Django app name>",
+        "module_name": "<original module name unchanged>",
+        "generation_order": <integer — 1 = generate first, based on dependencies>,
+        "entities": [
+          {
+            "name": "<FeatureModel>",
+            "base_class": "AuditedModel or MinimalModel",
+            "file_name": "<feature>_model.py",
+            "fields": [{"name": "<field>", "type": "<django field type>", "options": {}}],
+            "indexes": [["tenant_id", "status"], ["tenant_id", "created_at"]]
+          }
+        ],
+        "relationships": [
+          {"from": "<ModelA>", "to": "<ModelB>", "type": "ForeignKey|ManyToMany|OneToOne"}
+        ],
+        "services": [
+          {
+            "name": "<Feature>Service",
+            "file": "<feature>_service.py",
+            "methods": ["list_<feature>", "create_<feature>", "update_<feature>", "delete_<feature>"],
+            "repository": "_<Feature>Repository"
+          }
+        ],
+        "endpoints": [
+          {
+            "path": "/api/v1/<resource>/",
+            "method": "GET|POST|PUT|PATCH|DELETE",
+            "operation": "list|create|retrieve|update|partial_update|destroy|<custom>",
+            "required_roles": ["admin", "director", "manager"],
+            "serializer_fields": ["field1", "field2"],
+            "service_method": "<Feature>Service.<method_name>",
+            "business_logic": "<describe what the service method does>"
+          }
+        ],
+        "lookup_fields": ["<field_name_whose_values_come_from_Lookup_table>"],
+        "business_logic": ["<rule 1>", "<rule 2>"],
+        "has_shared_enum_deps": false
+      }
+    ]
+  }
+
+  Rules:
+  - app_name and project_name must be valid Python identifiers (snake_case, no spaces)
+  - generation_order must respect dependencies: apps with no dependencies get order 1
+  - Do NOT include an authentication app
+  - Include ALL modules as separate apps
+  - has_shared_enum_deps is true only if this app directly uses any of the shared enums
+  - Every endpoint must declare required_roles — read actions use ["IsAuthenticated"], write actions use ["admin", "director", "manager"] minimum
+  - lookup_fields lists any field whose valid values must be queried from common.Lookup table at runtime
+
+user_template: |
+  Module summaries to plan as Django apps:
+  {modules_json}
+
+  Dependency priority map (module_name -> priority, lower number = more foundational):
+  {dep_priority_json}
+
+  Shared enums available to all apps:
+  {shared_enums_json}
+
+  Global business rules applying to all modules:
+  {global_rules}
+
+  Produce a backend_plan JSON with project_name and apps array.
+  Each app entry must include: app_name, module_name, generation_order, entities (with base_class + file_name), relationships, services, endpoints (with required_roles + service_method), lookup_fields, business_logic, has_shared_enum_deps.

@@ -28,9 +28,9 @@ Enterprise AI-powered Full-Stack Development Agent.
 **Output:** Structured requirements JSON + dependency graph + Django DRF project on disk + React frontend plan
 
 **Deployed:** Kubernetes on VM, Docker, FastAPI backend
-**Package manager:** `uv` — ALWAYS `uv add`, NEVER `pip install`
-**Run server:** `uv run uvicorn main:app --reload`
-**Run migrations:** `uv run alembic upgrade head`
+**Package manager:** `pip` — standard pip + venv (`.venv` at `D:\shardi\.venv`, already activated)
+**Run server:** `python -m uvicorn main:app --reload`
+**Run migrations:** `alembic upgrade head`
 
 ---
 
@@ -42,7 +42,7 @@ InHouseAgents/
 ├── CLAUDE.md                        ← THIS FILE
 ├── README.md                        ← Source of truth documentation
 ├── EMBEDDING_AND_GRAPH_GUIDE.md     ← Embedding + Kuzu run guide
-├── requirements.txt                 ← pip requirements (uv managed)
+├── requirements.txt                 ← pip requirements
 ├── pyproject.toml
 ├── alembic.ini
 │
@@ -86,11 +86,12 @@ InHouseAgents/
     │   ├── clients/
     │   │   └── openai_client.py     ← call_llm_with_schema() — ALWAYS use this
     │   └── prompts/
-    │       ├── loader.py            ← _fmt() — NEVER .format()
+    │       ├── __init__.py          ← empty (no shared loader.py — by design)
     │       └── templates/
     │           ├── requirement_extractor/  ← DO NOT TOUCH
     │           ├── frontend_planner/       ← DO NOT TOUCH
-    │           └── backend_agent/          ← CREATE YAML prompts here
+    │           │   └── plan_module.yaml
+    │           └── backend_agent/          ← CREATE — Stage 3 YAML prompts here
     │
     ├── agents/
     │   ├── schemas/requirement_extractor/  ← DO NOT TOUCH
@@ -161,7 +162,7 @@ InHouseAgents/
 | 3 | **Call C = SUMMARIES ONLY** — finalize_node gets summaries never full extraction |
 | 4 | **3-layer JSON validation** — json_object + schema in prompt + Draft202012Validator. Max 2 retries. |
 | 5 | **All prompts in YAML** — never inline strings in Python |
-| 6 | **`_fmt()` not `.format()`** — ALWAYS use `_fmt()` from loader.py |
+| 6 | **`_fmt()` not `.format()`** — each node file defines its own local `_load_prompt()` + `_fmt()`. Copy exact pattern from `orchestration/planner/nodes.py` |
 | 7 | **`call_llm_with_schema()` only** — never call OpenAI SDK directly |
 | 8 | **tiktoken for token counting** — truncate before every LLM call |
 | 9 | **Django DRF only** — backend generation target always |
@@ -323,7 +324,53 @@ def _needs_custom_view(endpoint: dict) -> bool:
 
 ---
 
-## 8. LLM Call Pattern
+## 8. Prompt Loading Pattern (Verified — Local per file, NO shared loader.py)
+
+No `loader.py` exists. Each node file defines its own `_load_prompt()` + `_fmt()` locally.
+Copy this exact pattern from `orchestration/planner/nodes.py` into every Stage 3 file:
+
+```python
+from pathlib import Path
+import yaml
+
+_PROMPTS_DIR = (
+    Path(__file__).parent.parent.parent.parent  # adjust depth → src/msbc/
+    / "llm" / "prompts" / "templates" / "backend_agent"
+)
+
+def _load_prompt(name: str) -> dict[str, str]:
+    path = _PROMPTS_DIR / f"{name}.yaml"
+    with path.open(encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+def _fmt(template: str, **kwargs: str) -> str:
+    """str.replace — NOT .format() — JSON braces in YAML are safe"""
+    result = template
+    for key, value in kwargs.items():
+        result = result.replace(f"{{{key}}}", value)
+    return result
+
+# Usage:
+prompt_data = _load_prompt("models")   # loads backend_agent/models.yaml
+system = _fmt(prompt_data["system"], module_name=app_name)
+user   = _fmt(prompt_data["user_template"], entities_json=entities_str)
+```
+
+YAML structure (`llm/prompts/templates/backend_agent/models.yaml`):
+```yaml
+system: |
+  You are a senior Django developer. Generate models.py for {module_name}.
+  Return JSON: {"code": "<full python file as string>"}
+
+user_template: |
+  Module: {module_name}
+  Entities: {entities_json}
+  Business rules: {business_rules}
+```
+
+---
+
+## 9. LLM Call Pattern (Verified from openai_client.py)
 
 ```python
 from src.msbc.llm.clients.openai_client import call_llm_with_schema, count_tokens
@@ -371,13 +418,15 @@ Run order: `build_graph.py` → `build_rtk_code_graph.py --rebuild` → `embed_t
 
 - ❌ `contracts.py` anywhere
 - ❌ `--auth` flag in djcli
-- ❌ Django migration files
+- ❌ Django migration files for generated project
 - ❌ Nested LangGraph subgraphs
 - ❌ Inline prompt strings in Python
-- ❌ Direct OpenAI SDK calls
-- ❌ Blocking `subprocess.run()` in async
-- ❌ Hardcoded djcli path
+- ❌ Direct OpenAI SDK calls — always `call_llm_with_schema()`
+- ❌ Blocking `subprocess.run()` in async — always `asyncio.to_thread()`
+- ❌ Hardcoded djcli path — always `python -m djcli`
 - ❌ `sentence-transformers`
-- ❌ Touch Stage 1/2 files
-- ❌ Consolidate entities to base.py
-- ❌ `.format()` on prompt strings
+- ❌ Touch Stage 1/2/Embedding files
+- ❌ Consolidate entities to `base.py` — separate files always
+- ❌ `.format()` on prompt strings — always `_fmt()` with `str.replace`
+- ❌ Create shared `loader.py` — local `_load_prompt()` per file is the pattern
+- ❌ Import from `llm/prompts/loader.py` — it does not exist

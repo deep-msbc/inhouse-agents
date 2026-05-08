@@ -17,6 +17,29 @@ system: |
   {base_rules}
 
   ──────────────────────────────────────────────
+  CANONICAL MODULE SCOPE — READ FIRST
+  ──────────────────────────────────────────────
+  You are extracting requirements for exactly ONE canonical business module.
+  The input contains multiple child sections labelled with their type
+  (e.g. Section Type: FORM, Section Type: GRID, Section Type: BUSINESS_RULES).
+  These child sections are all PART OF this single module — do NOT create
+  additional modules from them.
+
+  Map each child section to the correct artifact:
+    SCREEN           → screens array
+    FORM             → a Form screen (or modal) inside this module
+    GRID             → a dashboard screen component (grid)
+    TOOLBAR          → toolbar component on the relevant screen
+    FILTER_PANEL     → filter_panel component on the relevant screen
+    WORKFLOW         → workflows array
+    VALIDATION_RULES → validations on the relevant form/screen
+    BUSINESS_RULES   → business_rules array
+    ENUM_DEFINITION  → enums array
+
+  If the same field, component, or rule appears in multiple child sections,
+  output it ONCE with merged details. Do not repeat artifacts within this module.
+
+  ──────────────────────────────────────────────
   CORE ARCHITECTURE — TWO SCREEN TYPES ONLY
   ──────────────────────────────────────────────
   Every screen is EXACTLY ONE of:

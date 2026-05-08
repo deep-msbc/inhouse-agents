@@ -148,7 +148,7 @@ InHouseAgents/                              ← repo root
 ├── CLAUDE.md                               ← AI session instructions (per-session read required)
 ├── EMBEDDING_AND_GRAPH_GUIDE.md            ← How to run the embedding pipeline
 ├── README.md                               ← THIS FILE — source of truth
-├── requirements.txt                        ← Pip requirements (canonical managed via uv + pyproject.toml)
+├── requirements.txt                        ← Canonical pip dependency list
 ├── run_commands.md                         ← Quick reference for dev commands
 │
 ├── app/                                    ← Application shell (framework-level concerns)
@@ -325,7 +325,7 @@ InHouseAgents/                              ← repo root
 |-----------|-----------|-------|
 | Runtime | Python 3.12 | |
 | Web framework | FastAPI + Uvicorn | |
-| Package manager | `uv` | Use `uv add` not `pip install` |
+| Package manager | `pip` | Install dependencies from `requirements.txt` |
 | App DB | PostgreSQL (prod) / SQLite (dev) | SQLAlchemy ORM + Alembic migrations |
 | ORM | SQLAlchemy 2.x (mapped_column style) | |
 | Migrations | Alembic | `alembic upgrade head` |
@@ -1419,52 +1419,52 @@ Three independent caps at different granularities:
 - Python 3.12
 - PostgreSQL (or SQLite for dev)
 - Qdrant (for embedding pipeline, `docker run -p 6333:6333 qdrant/qdrant`)
-- `uv` package manager (`pip install uv`)
+- `pip` package manager
 - `.env` file with at minimum `OPENAI_API_KEY`
 
 ### Install & Run
 
 ```bash
 # Install all dependencies
-uv sync
+pip install -r requirements.txt
 
 # Apply DB migrations
-uv run alembic upgrade head
+alembic upgrade head
 
 # Start the FastAPI server (dev mode with hot-reload)
-uv run uvicorn main:app --reload
+uvicorn main:app --reload
 
 # Or use the main.py uvicorn invocation directly:
-uv run python main.py
+python main.py
 ```
 
 ### One-time Embedding Setup (requires RTK_MONOREPO_PATH)
 
 ```bash
 # Build the KUZU semantic knowledge graph from toolkit_knowledge.py
-uv run python scripts/build_graph.py
+python scripts/build_graph.py
 
 # Build the KUZU code-level graph from monorepo source files
-uv run python scripts/build_rtk_code_graph.py
+python scripts/build_rtk_code_graph.py
 
 # Embed RTK monorepo source files into Qdrant (full first-time run)
-uv run python scripts/embed_toolkit.py --full-sync
+python scripts/embed_toolkit.py --full-sync
 
 # Embed curated examples into Qdrant
-uv run python scripts/embed_examples.py --full-sync
+python scripts/embed_examples.py --full-sync
 ```
 
 ### Incremental Embedding Updates
 
 ```bash
 # Preview what changed (no writes)
-uv run python scripts/embed_toolkit.py --dry-run
+python scripts/embed_toolkit.py --dry-run
 
 # Apply updates (only changed files re-embedded)
-uv run python scripts/embed_toolkit.py
+python scripts/embed_toolkit.py
 
 # Rebuild graph from scratch (after PACKAGES dict changes)
-uv run python scripts/build_graph.py --rebuild
+python scripts/build_graph.py --rebuild
 ```
 
 ### SQLite Dev Mode
@@ -1730,7 +1730,7 @@ Connect the Frontend Planner's `similarity_query` fields to actual Qdrant search
 | Component | Detail |
 |-----------|--------|
 | Runtime | Python 3.12, FastAPI + Uvicorn |
-| Package manager | `uv` (use `uv add`, never `pip install` for new deps) |
+| Package manager | `pip` (`pip install -r requirements.txt`) |
 | App DB | PostgreSQL via SQLAlchemy + Alembic |
 | Vector DB | Qdrant (`qdrant-client`) — `http://localhost:6333` |
 | Graph DB | KUZU embedded (`kuzu`) — `./data/toolkit_graph.kuzu` |

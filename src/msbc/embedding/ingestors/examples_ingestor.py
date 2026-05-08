@@ -384,13 +384,14 @@ async def _ingest_example_folder(
         return 0, False, []
 
     # ── Incremental sync check ────────────────────────────────────────────────
-    # The stored prefix for this folder (summary chunk path is excluded via __summary__).
+    # get_stored_file_hashes skips points with empty file_id (summary chunks)
+    # so stored_hashes already contains only real file paths.
     folder_prefix = (
         f"{examples_root.name}/{example_group}/{example_id}/"
     )
     stored_paths_for_folder = {
         fp for fp in stored_hashes
-        if fp.startswith(folder_prefix) and "__summary__" not in fp
+        if fp.startswith(folder_prefix)
     }
     disk_rel_paths = {_rel_path(fp) for fp in file_contents}
 
@@ -531,6 +532,8 @@ async def _ingest_example_folder(
             has_file_upload=features.get("has_file_upload", False),
             field_types_used=features.get("field_types_used", []),
             is_summary_chunk=False,
+            text=chunk.text,
+            summary=analysis["use_case"],
             text_hash=_text_hash(chunk.text_to_embed),
         )
 
@@ -548,17 +551,20 @@ async def _ingest_example_folder(
     )
 
     # Canonical file_path for the summary point — used for delete + indexing.
-    # Format: "correct_code_examples/{example_group}/{example_id}/__summary__"
+    # This is a synthetic chunk aggregating all files in the folder.
+    # The __summary__ suffix in file_path is a bookkeeping convention used by
+    # delete_by_file_path to target this specific point across runs.
+    # It does NOT correspond to a real file on disk.
     summary_rel_path = (
         f"{examples_root.name}/{example_group}/{example_id}/__summary__"
     )
 
     summary_payload = ExampleChunkPayload(
         file_path=summary_rel_path,
-        file_name="__summary__",
-        file_id="",          # synthetic — excluded from get_stored_file_hashes
+        file_name=example_id,          # the folder name, e.g. "Form03"
+        file_id="",                    # synthetic — excluded from get_stored_file_hashes
         chunk_id=summary_chunk.chunk_id,
-        chunk_index=9999,
+        chunk_index=0,
         total_chunks=1,
         language="tsx",
         example_id=example_id,
@@ -589,6 +595,8 @@ async def _ingest_example_folder(
         has_file_upload=aggregate_features.get("has_file_upload", False),
         field_types_used=aggregate_features.get("field_types_used", []),
         is_summary_chunk=True,
+        text=summary_chunk.text,
+        summary=summary_chunk.text,
         text_hash=_text_hash(summary_chunk.text_to_embed),
     )
 

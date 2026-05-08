@@ -19,16 +19,12 @@ import uuid
 from sqlalchemy import DateTime, ForeignKey, JSON, String, func
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.core.config import settings
 from src.msbc.database.base import Base
 
 
 def _uuid_col():
-    """Return a UUID column type compatible with both PostgreSQL and SQLite."""
-    if settings.DATABASE_URL.startswith("sqlite"):
-        return String(36)
-    from sqlalchemy.dialects.postgresql import UUID
-    return UUID(as_uuid=True)
+    """Always store UUIDs as VARCHAR(36) — matches the VARCHAR column in migrations."""
+    return String(36)
 
 
 class FrontendPlan(Base):
